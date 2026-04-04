@@ -141,7 +141,18 @@ SFT는 `sft/` 폴더에서 수행한다.
 
 ```bash
 cd sft
-CONFIG_PATH=configs/train_lora_qwen25vl3b.yaml \
+SFT_MODE=length \
+USE_VISION=true \
+CUDA_VISIBLE_DEVICES=0,1 \
+bash scripts/run_train.sh
+```
+
+Perspective SFT를 돌릴 때는:
+
+```bash
+cd sft
+SFT_MODE=perspective \
+USE_VISION=true \
 CUDA_VISIBLE_DEVICES=0,1 \
 bash scripts/run_train.sh
 ```
@@ -149,10 +160,10 @@ bash scripts/run_train.sh
 산출물:
 
 ```text
-sft/outputs/qwen25vl3b_lora_sft/
+sft/outputs/qwen25vl3b_lora_sft_length/
 ```
 
-이 디렉터리에는 SFT LoRA adapter가 저장된다.
+Perspective를 돌렸다면 산출물은 `sft/outputs/qwen25vl3b_lora_sft_perspective/`가 된다.
 
 ---
 
@@ -169,10 +180,10 @@ bash scripts/run_merge.sh
 기본 merge 결과:
 
 ```text
-sft/outputs/qwen25vl3b_lora_merged/
+sft/outputs/qwen25vl3b_lora_merged_length/
 ```
 
-이 디렉터리가 Step 4의 `QWEN_PATH`가 된다.
+Perspective를 merge했다면 `sft/outputs/qwen25vl3b_lora_merged_perspective/`가 된다.
 
 ---
 
@@ -181,7 +192,7 @@ sft/outputs/qwen25vl3b_lora_merged/
 레포 루트에서 실행:
 
 ```bash
-QWEN_PATH="$(pwd)/sft/outputs/qwen25vl3b_lora_merged" \
+QWEN_PATH="$(pwd)/sft/outputs/qwen25vl3b_lora_merged_length" \
 TRAIN_FILE="$(pwd)/data/video_r1/grpo/video_r1_grpo_train.jsonl" \
 TEST_FILE="$(pwd)/data/urban_video_bench/grpo/uvb_grpo_test.jsonl" \
 OUTPUT_DIR="$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only" \
@@ -227,7 +238,7 @@ sft/configs/merge_lora_grpo_run12.yaml
 예시 설정:
 
 ```yaml
-model_name_or_path: /absolute/path/to/sft/outputs/qwen25vl3b_lora_merged
+model_name_or_path: /absolute/path/to/sft/outputs/qwen25vl3b_lora_merged_length
 adapter_name_or_path: /absolute/path/to/src/r1-v/outputs/video_r1_uvb_grpo_answer_only
 export_dir: /absolute/path/to/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged
 remap_adapter_keys: true
@@ -296,14 +307,14 @@ bash src/scripts/prepare_uvb_grpo_data.sh
 
 # 2. SFT
 cd sft
-CONFIG_PATH=configs/train_lora_qwen25vl3b.yaml CUDA_VISIBLE_DEVICES=0,1 bash scripts/run_train.sh
+SFT_MODE=length USE_VISION=true CUDA_VISIBLE_DEVICES=0,1 bash scripts/run_train.sh
 
 # 3. SFT merge
 CONFIG_PATH=configs/merge_lora_qwen25vl3b.yaml bash scripts/run_merge.sh
 cd ..
 
 # 4. GRPO
-QWEN_PATH="$(pwd)/sft/outputs/qwen25vl3b_lora_merged" \
+QWEN_PATH="$(pwd)/sft/outputs/qwen25vl3b_lora_merged_length" \
 TRAIN_FILE="$(pwd)/data/video_r1/grpo/video_r1_grpo_train.jsonl" \
 TEST_FILE="$(pwd)/data/urban_video_bench/grpo/uvb_grpo_test.jsonl" \
 OUTPUT_DIR="$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only" \
@@ -335,7 +346,7 @@ python src/eval/uvb_eval_only.py \
 
 모델:
 
-- SFT merged model: `sft/outputs/qwen25vl3b_lora_merged/`
+- SFT merged model: `sft/outputs/qwen25vl3b_lora_merged_length/` 또는 `sft/outputs/qwen25vl3b_lora_merged_perspective/`
 - GRPO adapter output: `src/r1-v/outputs/video_r1_uvb_grpo_answer_only/`
 - GRPO merged model: `src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged/`
 

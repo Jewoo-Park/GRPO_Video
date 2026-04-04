@@ -1,0 +1,15 @@
+model_name_or_path: Qwen/Qwen2.5-VL-72B-Instruct
+input_path: data/video_r1_cot/processed/train.jsonl
+output_dir: outputs/generate_granularity
+output_name: generated.jsonl
+summary_name: summary.json
+annotation_task: generate_granularity
+max_samples: null
+frames_per_sample: 8
+temperature: 0.3
+max_completion_tokens: 768
+gpu_memory_utilization: 0.85
+device: cuda
+max_model_len: 8192
+max_pixels: 501760
+min_pixels: 3136

@@ -2,15 +2,22 @@
 
 이 문서는 환경 세팅부터 SFT LoRA 어댑터를 백본 모델에 merge하는 전 과정을 기록합니다.
 
+현재 SFT는 두 가지 모드를 지원합니다.
+
+- `length`: Direct Answer / CoT / Long CoT supervision
+- `perspective`: Abstract / Temporal / Spatio-temporal reasoning perspective supervision
+
+둘 다 merge 절차는 동일하고, 단지 adapter/output 경로만 다릅니다.
+
 ---
 
 ## 전제 조건
 
 | 항목 | 경로 |
 |------|------|
-| SFT LoRA 어댑터 | `sft/outputs/qwen25vl3b_lora_sft/` |
+| SFT LoRA 어댑터 | `sft/outputs/qwen25vl3b_lora_sft_length/` 또는 `sft/outputs/qwen25vl3b_lora_sft_perspective/` |
 | 백본 모델 | `Qwen/Qwen2.5-VL-3B-Instruct` (HuggingFace에서 자동 다운로드) |
-| merge 결과 | `sft/outputs/qwen25vl3b_lora_merged/` |
+| merge 결과 | `sft/outputs/qwen25vl3b_lora_merged_length/` 또는 `sft/outputs/qwen25vl3b_lora_merged_perspective/` |
 
 ---
 
@@ -75,13 +82,20 @@ pip install flash-attn --no-build-isolation --no-binary :all:
 
 ## 4단계: merge 설정 파일 확인
 
-`sft/configs/merge_lora_qwen25vl3b.yaml`:
+예를 들어 length SFT adapter를 merge하려면 `sft/configs/merge_lora_qwen25vl3b.yaml` 또는 그에 준하는 설정에서 아래 세 값을 맞춘다.
 
 ```yaml
 model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
-adapter_name_or_path: ./outputs/qwen25vl3b_lora_sft
-export_dir: ./outputs/qwen25vl3b_lora_merged
+adapter_name_or_path: ./outputs/qwen25vl3b_lora_sft_length
+export_dir: ./outputs/qwen25vl3b_lora_merged_length
 remap_adapter_keys: true
+```
+
+perspective SFT를 merge할 때는 대응 경로만 바꾸면 된다.
+
+```yaml
+adapter_name_or_path: ./outputs/qwen25vl3b_lora_sft_perspective
+export_dir: ./outputs/qwen25vl3b_lora_merged_perspective
 ```
 
 > **`remap_adapter_keys: true` 필수.**
@@ -95,6 +109,8 @@ remap_adapter_keys: true
 cd /workspace/GRPO_Video/sft
 CONFIG_PATH=configs/merge_lora_qwen25vl3b.yaml bash scripts/run_merge.sh
 ```
+
+원하는 adapter가 length인지 perspective인지에 맞게 `CONFIG_PATH`의 경로만 바꾸면 된다.
 
 정상 진행 시 출력:
 ```
@@ -111,7 +127,7 @@ Loading checkpoint shards: 100%|███████| 2/2 [...]
 ## 6단계: merge 결과 검증
 
 ```bash
-ls -lh /workspace/GRPO_Video/sft/outputs/qwen25vl3b_lora_merged/
+ls -lh /workspace/GRPO_Video/sft/outputs/qwen25vl3b_lora_merged_length/
 ```
 
 정상 결과:
@@ -139,12 +155,17 @@ pip install flash-attn --no-build-isolation --no-binary :all:
 
 # GRPO 실행
 cd /workspace/GRPO_Video/src/scripts
-export QWEN_PATH="/workspace/GRPO_Video/sft/outputs/qwen25vl3b_lora_merged"
+export QWEN_PATH="/workspace/GRPO_Video/sft/outputs/qwen25vl3b_lora_merged_length"
 export NUM_GPUS=3
 export TRAIN_NUM_GPUS=2
 export CUDA_VISIBLE_DEVICES=0,1,2
 ./run_grpo_uvb_answer_only.sh
 ```
+
+현재는 `QWEN_PATH`에 아래 둘 중 하나를 넣는다고 이해하면 된다.
+
+- `sft/outputs/qwen25vl3b_lora_merged_length`
+- `sft/outputs/qwen25vl3b_lora_merged_perspective`
 
 ---
 

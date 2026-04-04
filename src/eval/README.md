@@ -3,6 +3,8 @@
 ## 개요
 이 폴더는 이 레포에서 사용하는 비디오 데이터셋을 공통 형식으로 전처리하고, 최종적으로 GRPO 학습/평가에 바로 넣을 수 있는 JSONL을 만드는 역할을 담당한다.
 
+중요하게, 이 폴더는 `GRPO`용 데이터 준비를 담당한다. `SFT`용 length/perspective 데이터 생성은 별도 디렉터리인 `video_r1_sft_annotator/`에서 수행한다.
+
 현재 기준 데이터 흐름은 다음과 같다.
 
 - Train Set: Video-R1
@@ -24,6 +26,17 @@
 -> data_to_grpo.py
 -> grpo/*.jsonl
 -> 학습 또는 평가
+```
+
+SFT 쪽 흐름은 별도로 아래와 같다.
+
+```text
+Video-R1 processed/train.jsonl + frames
+-> video_r1_sft_annotator.annotate
+-> generated.jsonl
+-> export_sft_dataset.py
+-> length SFT JSON 또는 perspective SFT JSON
+-> sft/scripts/run_train.sh
 ```
 
 

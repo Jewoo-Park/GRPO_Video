@@ -13,6 +13,11 @@
 - 최종 데이터 형식: 공통 GRPO JSONL
 - 평가 벤치마크는 UVB를 유지
 
+SFT는 현재 두 갈래로 운영된다.
+
+- `length` SFT: Direct Answer / CoT / Long CoT
+- `perspective` SFT: Reasoning Type / Reasoning / Answer
+
 즉 이 레포는 더 이상 UVB만으로 학습하는 구조가 아니라, `Video-R1로 학습하고 UVB로 평가하는 구조`로 바뀌어 있다.
 
 ---
@@ -50,6 +55,12 @@ GRPO_Video/
 │   ├── data/
 │   ├── scripts/
 │   ├── outputs/
+│   └── README.md
+│
+├── video_r1_sft_annotator/     # Video-R1 기반 SFT dataset 생성/annotation/export
+│   ├── configs/
+│   ├── scripts/
+│   ├── src/video_r1_sft_annotator/
 │   └── README.md
 │
 ├── src/
@@ -135,7 +146,8 @@ MMVU 원본
 |------|------|----------------|------|------|
 | 데이터 준비 (Train) | Video-R1를 학습용으로 전처리 | `prepare_video_r1_grpo.py` → `data_to_grpo.py` | HF `Video-R1/Video-R1-data` | `data/video_r1/grpo/video_r1_grpo_train.jsonl` |
 | 데이터 준비 (Test 1) | UVB를 평가용으로 전처리 | `prepare_uvb_pipeline.py` → `data_to_grpo.py` | HF `EmbodiedCity/UrbanVideo-Bench` | `data/urban_video_bench/grpo/uvb_grpo_test.jsonl` |
-| SFT | Qwen2.5-VL-3B에 LoRA SFT | `sft/scripts/run_train.sh` | `sft/data/*.json` | `sft/outputs/...` |
+| SFT dataset 생성 | Video-R1에서 length/perspective SFT JSON 생성 | `video_r1_sft_annotator` 하위 스크립트 | `processed/train.jsonl`, 프레임 | `outputs/sft/*.json` |
+| SFT | Qwen2.5-VL-3B에 LoRA SFT | `sft/scripts/run_train.sh` | length 또는 perspective JSON | `sft/outputs/...` |
 | Merge | LoRA 병합 | `sft/scripts/run_merge.sh` | merged 설정 파일 | merged 모델 디렉터리 |
 | GRPO | Video-R1 train / UVB test로 학습 및 테스트 추론 | `run_grpo_uvb_answer_only.sh` → `open_r1.grpo_video` | `video_r1_grpo_train.jsonl`, `uvb_grpo_test.jsonl`, merged 모델 | `src/r1-v/outputs/...` |
 | Eval | 저장된 모델로 UVB 테스트만 별도 평가 | `uvb_eval_only.py` | `--model`, `--test-file` | 터미널 메트릭, 선택 시 예측/JSON 파일 |
@@ -194,6 +206,37 @@ MMVU 원본
 | `frame_subdir` | 프레임이 저장된 상대 서브디렉터리 |
 
 즉 `processed/`는 사람이 보기에도 전처리된 중간 문제집이고, `grpo/`는 학습 코드가 바로 읽는 최종 문제집이다.
+
+
+### 3.3 SFT 입력 형식
+
+현재 SFT는 두 가지 출력 스키마를 직접 학습할 수 있다.
+
+#### A. Reasoning Length
+
+```json
+{
+  "instruction": "...",
+  "input": "",
+  "frames": [".../frame_000.jpg", ".../frame_001.jpg"],
+  "output": "<COT>...</COT>\n<ANSWER>A</ANSWER>"
+}
+```
+
+이 모드는 하나의 문제를 `ANSWER`, `COT`, `LONG_COT` supervision으로 확장한다.
+
+#### B. Reasoning Perspective
+
+```json
+{
+  "instruction": "...",
+  "input": "",
+  "frames": [".../frame_000.jpg", ".../frame_001.jpg"],
+  "output": "<REASONING_TYPE>TEMPORAL</REASONING_TYPE>\n<REASONING>...</REASONING>\n<ANSWER>A</ANSWER>"
+}
+```
+
+이 모드는 모델이 `(V, q, O)`만 보고 `REASONING_TYPE -> REASONING -> ANSWER`를 순서대로 생성하도록 학습한다.
 
 ---
 

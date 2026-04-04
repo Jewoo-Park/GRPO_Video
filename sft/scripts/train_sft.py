@@ -86,6 +86,7 @@ class TrainConfig:
     lora_alpha: int = 128
     lora_dropout: float = 0.05
     lora_target_modules: Any = "auto"
+    sft_mode: str = "length"
     reasoning_formats: List[str] = field(default_factory=lambda: ["answer", "cot", "long_cot"])
     format_mix_strategy: str = "expand"
     append_format_instruction: bool = True
@@ -93,11 +94,16 @@ class TrainConfig:
 
 
 SUPPORTED_REASONING_FORMATS = {"answer", "cot", "long_cot"}
+SUPPORTED_SFT_MODES = {"length", "perspective"}
 FORMAT_INSTRUCTIONS = {
     "answer": "Respond using only <ANSWER>...</ANSWER>.",
     "cot": "Respond using <COT>...</COT> followed by <ANSWER>...</ANSWER>.",
     "long_cot": "Respond using <LONG_COT>...</LONG_COT> followed by <ANSWER>...</ANSWER>.",
 }
+PERSPECTIVE_FORMAT_INSTRUCTION = (
+    "Respond using <REASONING_TYPE>...</REASONING_TYPE> followed by "
+    "<REASONING>...</REASONING> and <ANSWER>...</ANSWER>."
+)
 
 
 def load_config(path: str) -> TrainConfig:
@@ -106,6 +112,7 @@ def load_config(path: str) -> TrainConfig:
     cfg = TrainConfig(**raw)
     if cfg.merge_output_dir is None:
         cfg.merge_output_dir = f"{cfg.output_dir}_merged"
+    cfg.sft_mode = normalize_sft_mode(cfg.sft_mode)
     return cfg
 
 
@@ -207,12 +214,27 @@ def normalize_reasoning_formats(formats: List[str]) -> List[str]:
     return normalized
 
 
+def normalize_sft_mode(mode: str) -> str:
+    normalized = str(mode or "").strip().lower()
+    if normalized not in SUPPORTED_SFT_MODES:
+        raise ValueError(f"Unsupported sft_mode: {mode}. Supported: {sorted(SUPPORTED_SFT_MODES)}")
+    return normalized
+
+
 def extract_tag_block(text: str, tag: str) -> Optional[str]:
     pattern = rf"(<{tag}>\s*.*?\s*</{tag}>)"
     match = re.search(pattern, text, flags=re.DOTALL)
     if not match:
         return None
     return match.group(1).strip()
+
+
+def extract_first_tag_block(text: str, tags: List[str]) -> Optional[str]:
+    for tag in tags:
+        block = extract_tag_block(text, tag)
+        if block is not None:
+            return block
+    return None
 
 
 def build_targets_for_sample(
@@ -242,6 +264,21 @@ def build_targets_for_sample(
     if format_mix_strategy != "expand":
         raise ValueError("format_mix_strategy must be either 'expand' or 'single'")
     return candidates
+
+
+def build_perspective_target(output_text: str) -> Optional[str]:
+    reasoning_type_block = extract_first_tag_block(
+        output_text,
+        ["REASONING_TYPE", "GRANULARITY_TYPE", "PERSPECTIVE"],
+    )
+    reasoning_block = extract_first_tag_block(
+        output_text,
+        ["REASONING", "THINKING"],
+    )
+    answer_block = extract_tag_block(output_text, "ANSWER")
+    if not reasoning_type_block or not reasoning_block or not answer_block:
+        return None
+    return "\n".join([reasoning_type_block, reasoning_block, answer_block])
 
 
 def build_user_text(instruction: str, user_input: str, format_instruction: str = "") -> str:
@@ -393,6 +430,7 @@ def preprocess_samples(
     config: TrainConfig,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     enabled_formats = normalize_reasoning_formats(config.reasoning_formats)
+    sft_mode = normalize_sft_mode(config.sft_mode)
     stats = Counter()
     processed = []
 
@@ -402,23 +440,42 @@ def preprocess_samples(
         if parsed is None:
             continue
 
-        targets = build_targets_for_sample(
-            output_text=parsed["output_text"],
-            enabled_formats=enabled_formats,
-            drop_code_cot=config.drop_code_cot,
-            format_mix_strategy=config.format_mix_strategy,
-        )
-        if not targets:
-            if config.drop_code_cot and extract_tag_block(parsed["output_text"], "CODE") is not None:
-                stats["skip_code_cot"] += 1
-            else:
-                stats["skip_no_matching_format"] += 1
-            continue
-
-        for reasoning_format, answer in targets:
-            format_instruction = (
-                FORMAT_INSTRUCTIONS[reasoning_format] if config.append_format_instruction else ""
+        if sft_mode == "length":
+            targets = build_targets_for_sample(
+                output_text=parsed["output_text"],
+                enabled_formats=enabled_formats,
+                drop_code_cot=config.drop_code_cot,
+                format_mix_strategy=config.format_mix_strategy,
             )
+            if not targets:
+                if config.drop_code_cot and extract_tag_block(parsed["output_text"], "CODE") is not None:
+                    stats["skip_code_cot"] += 1
+                else:
+                    stats["skip_no_matching_format"] += 1
+                continue
+
+            target_specs = [
+                (
+                    reasoning_format,
+                    answer,
+                    FORMAT_INSTRUCTIONS[reasoning_format] if config.append_format_instruction else "",
+                )
+                for reasoning_format, answer in targets
+            ]
+        else:
+            perspective_target = build_perspective_target(parsed["output_text"])
+            if perspective_target is None:
+                stats["skip_missing_perspective_tags"] += 1
+                continue
+            target_specs = [
+                (
+                    "perspective",
+                    perspective_target,
+                    PERSPECTIVE_FORMAT_INSTRUCTION if config.append_format_instruction else "",
+                )
+            ]
+
+        for target_name, answer, format_instruction in target_specs:
             user_text = build_user_text(
                 parsed["instruction"],
                 parsed["user_input"],
@@ -457,7 +514,7 @@ def preprocess_samples(
                 }
             )
             modality_key = "visual" if parsed["image_paths"] else "text"
-            stats[f"kept_{modality_key}_{reasoning_format}"] += 1
+            stats[f"kept_{modality_key}_{target_name}"] += 1
 
     stats["kept_total"] = len(processed)
     return processed, dict(stats)
@@ -577,6 +634,7 @@ def train(config: TrainConfig) -> None:
     if getattr(model, "config", None) is not None:
         model.config.use_cache = False
 
+    print(f"[SFT] sft_mode: {config.sft_mode}")
     print(f"[SFT] use_vision: {config.use_vision}")
     print(f"[SFT] resolved LoRA target module count: {len(target_modules)}")
 

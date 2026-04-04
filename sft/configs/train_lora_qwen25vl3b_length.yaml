@@ -1,9 +1,8 @@
 model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
 train_files:
-  - ./data/aqua_rat_multiple_choice.json
-  - ./data/aqua_rat_open_form.json
-output_dir: ./outputs/qwen25vl3b_lora_sft
-merge_output_dir: ./outputs/qwen25vl3b_lora_merged
+  - ./data/video_r1_length_sft.json
+output_dir: ./outputs/qwen25vl3b_lora_sft_length
+merge_output_dir: ./outputs/qwen25vl3b_lora_merged_length
 
 max_length: 4096
 val_size: 0.05
@@ -27,7 +26,7 @@ save_steps: 200
 eval_steps: 200
 save_total_limit: 3
 gradient_checkpointing: true
-use_vision: false
+use_vision: true
 max_visual_items: 16
 
 lora_r: 64
@@ -36,16 +35,10 @@ lora_dropout: 0.05
 lora_target_modules: auto
 
 sft_mode: length
-
-# Available formats: answer, cot, long_cot
-# - CODE-style CoT is excluded when drop_code_cot=true.
 reasoning_formats:
   - answer
   - cot
   - long_cot
-
-# expand: create one sample per selected format if available
-# single: keep only first available format from reasoning_formats order
 format_mix_strategy: expand
 append_format_instruction: true
 drop_code_cot: true

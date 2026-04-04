@@ -5,10 +5,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SFT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${SFT_DIR}"
 
-CONFIG_PATH="${CONFIG_PATH:-configs/train_lora_qwen25vl3b.yaml}"
+SFT_MODE="${SFT_MODE:-length}"
+CONFIG_PATH="${CONFIG_PATH:-}"
 MASTER_PORT="${MASTER_PORT:-12355}"
 MERGE_AFTER_TRAIN="${MERGE_AFTER_TRAIN:-true}"
 USE_VISION="${USE_VISION:-}"
+
+if [[ -z "${CONFIG_PATH}" ]]; then
+  case "${SFT_MODE}" in
+    length)
+      CONFIG_PATH="configs/train_lora_qwen25vl3b_length.yaml"
+      ;;
+    perspective)
+      CONFIG_PATH="configs/train_lora_qwen25vl3b_perspective.yaml"
+      ;;
+    *)
+      echo "[SFT-PIPELINE] Unsupported SFT_MODE: ${SFT_MODE}" >&2
+      exit 1
+      ;;
+  esac
+fi
 
 if [[ -z "${USE_VISION}" ]]; then
   read -r -p "[SFT] 이미지/프레임 입력을 사용할까요? [y/N]: " USE_VISION_REPLY
@@ -32,6 +48,7 @@ if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
 fi
 
 echo "[SFT-PIPELINE] config: ${CONFIG_PATH}"
+echo "[SFT-PIPELINE] mode: ${SFT_MODE}"
 echo "[SFT-PIPELINE] USE_VISION=${USE_VISION}"
 echo "[SFT-PIPELINE] NUM_GPUS=${NUM_GPUS}"
 echo "[SFT-PIPELINE] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"

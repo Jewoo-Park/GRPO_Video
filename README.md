@@ -39,10 +39,9 @@
 
 - 텍스트 SFT
 - 이미지/프레임을 포함한 멀티모달 SFT
-- 출력 태그 형식:
-  - `<ANSWER>...</ANSWER>`
-  - `<COT>...</COT><ANSWER>...</ANSWER>`
-  - `<LONG_COT>...</LONG_COT><ANSWER>...</ANSWER>`
+- 두 가지 SFT 목표 지원:
+  - `length`: `<ANSWER>`, `<COT>`, `<LONG_COT>` 길이 supervision
+  - `perspective`: `<REASONING_TYPE>`, `<REASONING>`, `<ANSWER>` supervision
 
 ### 2-2. SFT merge
 
@@ -139,7 +138,8 @@ SFT 관련 코드가 들어 있습니다.
 - `sft/scripts/run_train.sh`
 - `sft/scripts/run_merge.sh`
 - `sft/scripts/run_pipeline.sh`
-- `sft/configs/train_lora_qwen25vl3b.yaml`
+- `sft/configs/train_lora_qwen25vl3b_length.yaml`
+- `sft/configs/train_lora_qwen25vl3b_perspective.yaml`
 - `sft/configs/merge_lora_qwen25vl3b.yaml`
 - `sft/configs/merge_lora_grpo_run12.yaml`
 
@@ -252,6 +252,19 @@ GRPO 학습 핵심 코드입니다.
 ]
 ```
 
+또는 Dataset 2처럼 추론 관점까지 직접 예측하는 형식:
+
+```json
+[
+  {
+    "instruction": "프레임을 보고 문제를 푸시오 ...",
+    "input": "",
+    "frames": ["frame_000.jpg", "frame_001.jpg"],
+    "output": "<REASONING_TYPE>TEMPORAL</REASONING_TYPE>\n<REASONING>...</REASONING>\n<ANSWER>B</ANSWER>"
+  }
+]
+```
+
 또는:
 
 ```json
@@ -332,24 +345,26 @@ USE_VISION=false bash scripts/run_pipeline.sh
 
 ```bash
 cd sft
-USE_VISION=true bash scripts/run_pipeline.sh
+SFT_MODE=length USE_VISION=true bash scripts/run_pipeline.sh
 ```
 
 학습만 하고 merge는 나중에:
 
 ```bash
 cd sft
-USE_VISION=true bash scripts/run_train.sh
+SFT_MODE=length USE_VISION=true bash scripts/run_train.sh
 ```
 
 ### 6-5. SFT 결과물
 
-기본 출력:
+기본 출력은 SFT 모드에 따라 달라진다.
 
-- LoRA 어댑터:
-  - `sft/outputs/qwen25vl3b_lora_sft/`
-- merge 결과:
-  - `sft/outputs/qwen25vl3b_lora_merged/`
+- length:
+  - LoRA 어댑터: `sft/outputs/qwen25vl3b_lora_sft_length/`
+  - merge 결과: `sft/outputs/qwen25vl3b_lora_merged_length/`
+- perspective:
+  - LoRA 어댑터: `sft/outputs/qwen25vl3b_lora_sft_perspective/`
+  - merge 결과: `sft/outputs/qwen25vl3b_lora_merged_perspective/`
 
 ---
 
@@ -362,14 +377,16 @@ SFT 이후 LoRA 어댑터를 백본 모델에 병합합니다.
 - `sft/scripts/merge_lora.py`
 - `sft/configs/merge_lora_qwen25vl3b.yaml`
 
-기본 설정:
+예를 들어 length SFT용 merge 설정:
 
 ```yaml
 model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
-adapter_name_or_path: ./outputs/qwen25vl3b_lora_sft
-export_dir: ./outputs/qwen25vl3b_lora_merged
+adapter_name_or_path: ./outputs/qwen25vl3b_lora_sft_length
+export_dir: ./outputs/qwen25vl3b_lora_merged_length
 remap_adapter_keys: true
 ```
+
+perspective SFT를 merge할 때는 adapter/export 경로만 `..._perspective`로 바꾸면 된다.
 
 ### 왜 `remap_adapter_keys: true`가 중요한가
 
@@ -429,7 +446,7 @@ GRPO는 기본적으로 **SFT를 merge한 모델**을 시작점으로 사용합�
 예시:
 
 ```bash
-QWEN_PATH="$(pwd)/sft/outputs/qwen25vl3b_lora_merged" \
+QWEN_PATH="$(pwd)/sft/outputs/qwen25vl3b_lora_merged_length" \
 TRAIN_FILE="$(pwd)/data/video_r1/grpo/video_r1_grpo_train.jsonl" \
 TEST_FILE="$(pwd)/data/urban_video_bench/grpo/uvb_grpo_test.jsonl" \
 OUTPUT_DIR="$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only" \
@@ -531,7 +548,7 @@ GRPO 완료 후에는 다시 LoRA 어댑터를 merge할 수 있습니다.
 현재 기본 예시는:
 
 ```yaml
-model_name_or_path: ./outputs/qwen25vl3b_lora_merged
+model_name_or_path: ./outputs/qwen25vl3b_lora_merged_length
 adapter_name_or_path: ../src/r1-v/outputs/uvb_grpo_run12
 export_dir: ../src/r1-v/outputs/uvb_grpo_run12_merged
 remap_adapter_keys: true
@@ -633,14 +650,14 @@ bash src/scripts/prepare_all_grpo_data.sh
 
 ```bash
 cd sft
-bash scripts/run_pipeline.sh
+SFT_MODE=length bash scripts/run_pipeline.sh
 ```
 
 ### 14-4. GRPO
 
 ```bash
 cd ..
-QWEN_PATH="$(pwd)/sft/outputs/qwen25vl3b_lora_merged" \
+QWEN_PATH="$(pwd)/sft/outputs/qwen25vl3b_lora_merged_length" \
 TRAIN_FILE="$(pwd)/data/video_r1/grpo/video_r1_grpo_train.jsonl" \
 TEST_FILE="$(pwd)/data/urban_video_bench/grpo/uvb_grpo_test.jsonl" \
 OUTPUT_DIR="$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only" \
@@ -655,7 +672,7 @@ bash src/scripts/run_grpo_uvb_answer_only.sh
 ```bash
 cd sft
 python scripts/merge_lora.py \
-  --model-name-or-path ./outputs/qwen25vl3b_lora_merged \
+  --model-name-or-path ./outputs/qwen25vl3b_lora_merged_length \
   --adapter-name-or-path ../src/r1-v/outputs/video_r1_uvb_grpo_answer_only \
   --export-dir ../src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged \
   --remap-adapter-keys true
@@ -697,4 +714,3 @@ python scripts/merge_lora.py \
 - [`sft/README.md`](/Users/jw246/Desktop/NTU%20COSMO%20LAB/cloned%20Repos/GRPO_Video_2/sft/README.md)
 - [`src/eval/README.md`](/Users/jw246/Desktop/NTU%20COSMO%20LAB/cloned%20Repos/GRPO_Video_2/src/eval/README.md)
 - [`REPO_STRUCTURE_AND_REVIEW.md`](/Users/jw246/Desktop/NTU%20COSMO%20LAB/cloned%20Repos/GRPO_Video_2/REPO_STRUCTURE_AND_REVIEW.md)
-

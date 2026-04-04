@@ -1,6 +1,13 @@
 .DS_Store
 __pycache__/
 *.pyc
+tmp/
+video_r1_sft_annotator/.git/
+video_r1_sft_annotator/.venv/
+video_r1_sft_annotator/.tmp_export_test/
+video_r1_sft_annotator/**/__pycache__/
+video_r1_sft_annotator/.DS_Store
+video_r1_sft_annotator/src/.DS_Store
 
 # Training outputs/logs
 src/r1-v/outputs/
