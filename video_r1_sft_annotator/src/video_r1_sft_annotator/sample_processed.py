@@ -60,17 +60,26 @@ def quotas_for_preset(name: str) -> dict[str, int]:
     raise ValueError(f"Unsupported preset: {name}")
 
 
-def load_excluded_ids(exclude_dir: Path) -> set[str]:
-    train_path = exclude_dir / "train.jsonl"
+def row_identity_key(row: dict) -> str:
+    """question_id 우선, 없으면 video_path + question 조합으로 식별."""
+    qid = str(row.get("question_id") or "").strip()
+    if qid:
+        return qid
+    video = str(row.get("video_path") or row.get("frame_subdir") or "").strip()
+    question = str(row.get("question") or "").strip()
+    return f"{video}||{question}"
+
+
+def load_excluded_ids(exclude_path: Path) -> set[str]:
+    """exclude_path는 train.jsonl 파일 또는 그것을 포함한 디렉토리."""
+    if exclude_path.is_dir():
+        train_path = exclude_path / "train.jsonl"
+    else:
+        train_path = exclude_path
     if not train_path.exists():
-        raise SystemExit(f"--exclude-dir given but train.jsonl not found: {train_path}")
+        raise SystemExit(f"--exclude-dir/file: train.jsonl not found at {train_path}")
     rows = load_jsonl(train_path)
-    excluded: set[str] = set()
-    for row in rows:
-        qid = str(row.get("question_id") or "").strip()
-        if qid:
-            excluded.add(qid)
-    return excluded
+    return {row_identity_key(row) for row in rows}
 
 
 def main() -> None:
@@ -87,12 +96,12 @@ def main() -> None:
     excluded_ids: set[str] = set()
     if args.exclude_dir:
         excluded_ids = load_excluded_ids(Path(args.exclude_dir))
-        print(f"[sample] excluding {len(excluded_ids)} already-sampled question_ids from {args.exclude_dir}")
+        print(f"[sample] excluding {len(excluded_ids)} already-sampled rows from {args.exclude_dir}")
 
     rows = load_jsonl(train_path)
     if excluded_ids:
         before = len(rows)
-        rows = [r for r in rows if str(r.get("question_id") or "").strip() not in excluded_ids]
+        rows = [r for r in rows if row_identity_key(r) not in excluded_ids]
         print(f"[sample] filtered {before} → {len(rows)} rows after exclusion")
 
     rows_by_subset: dict[str, list[dict]] = defaultdict(list)
