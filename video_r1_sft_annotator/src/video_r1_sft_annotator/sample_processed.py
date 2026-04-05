@@ -22,6 +22,20 @@ DEFAULT_QUOTAS_4K = {
     "PerceptionTest": 70,
 }
 
+DEFAULT_QUOTAS_6K = {
+    "LLaVA-Video-178K": 2100,
+    "Knowledge": 750,
+    "Math": 675,
+    "Chart": 450,
+    "Spatial": 375,
+    "General": 270,
+    "STAR": 450,
+    "NeXT-QA": 330,
+    "OCR": 270,
+    "CLEVRER": 225,
+    "PerceptionTest": 105,
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sample a smaller processed dataset with fixed subset quotas.")
@@ -29,13 +43,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--preset", type=str, default="balanced_4k")
+    parser.add_argument(
+        "--exclude-dir",
+        type=str,
+        default=None,
+        help="Path to a previously sampled output dir. Rows already sampled there will be excluded.",
+    )
     return parser.parse_args()
 
 
 def quotas_for_preset(name: str) -> dict[str, int]:
     if name == "balanced_4k":
         return dict(DEFAULT_QUOTAS_4K)
+    if name == "additional_6k":
+        return dict(DEFAULT_QUOTAS_6K)
     raise ValueError(f"Unsupported preset: {name}")
+
+
+def load_excluded_ids(exclude_dir: Path) -> set[str]:
+    train_path = exclude_dir / "train.jsonl"
+    if not train_path.exists():
+        raise SystemExit(f"--exclude-dir given but train.jsonl not found: {train_path}")
+    rows = load_jsonl(train_path)
+    excluded: set[str] = set()
+    for row in rows:
+        qid = str(row.get("question_id") or "").strip()
+        if qid:
+            excluded.add(qid)
+    return excluded
 
 
 def main() -> None:
@@ -49,7 +84,17 @@ def main() -> None:
     if not train_path.exists():
         raise SystemExit(f"Missing input file: {train_path}")
 
+    excluded_ids: set[str] = set()
+    if args.exclude_dir:
+        excluded_ids = load_excluded_ids(Path(args.exclude_dir))
+        print(f"[sample] excluding {len(excluded_ids)} already-sampled question_ids from {args.exclude_dir}")
+
     rows = load_jsonl(train_path)
+    if excluded_ids:
+        before = len(rows)
+        rows = [r for r in rows if str(r.get("question_id") or "").strip() not in excluded_ids]
+        print(f"[sample] filtered {before} → {len(rows)} rows after exclusion")
+
     rows_by_subset: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
         rows_by_subset[str(row.get("source_subset") or "UNKNOWN")].append(row)
@@ -106,7 +151,9 @@ def main() -> None:
         "seed": args.seed,
         "input_dir": str(input_dir.resolve()),
         "output_dir": str(output_dir.resolve()),
-        "input_rows": len(rows),
+        "exclude_dir": args.exclude_dir,
+        "excluded_ids": len(excluded_ids),
+        "input_rows_after_exclusion": len(rows),
         "sampled_rows": len(sampled_rows),
         "linked_frames_dir": str(src_frames_dir),
         "unique_frame_subdirs": len(unique_frame_subdirs),
