@@ -47,6 +47,28 @@ cd sft
 SFT_MODE=perspective USE_VISION=true CUDA_VISIBLE_DEVICES=0,1 bash scripts/run_train.sh
 ```
 
+raw annotation JSONL에서 최종 SFT JSONL을 만드는 변환기도 포함되어 있습니다. 현재 생성 중인 raw 샘플 형식이 아래와 같다면:
+
+- Dataset 1 raw: `question / options / gold_answer / frame_subdir / answer_raw / cot_raw / long_cot_raw`
+- Dataset 2 raw: `question / options / gold_answer / frame_subdir / granularity_type / granularity_thinking_raw`
+
+다음처럼 바로 최종 학습 파일로 바꿀 수 있습니다.
+
+```bash
+cd sft
+python scripts/prepare_sft_dataset.py \
+  --mode length \
+  --input data/generated_length_0_500.jsonl \
+  --output data/video_r1_length_sft.jsonl
+
+python scripts/prepare_sft_dataset.py \
+  --mode perspective \
+  --input data/generated_granulity_0_1000.jsonl \
+  --output data/video_r1_perspective_sft.jsonl
+```
+
+기본적으로 `--input` 파일이 있는 폴더의 `frames/`를 찾아서 `frame_subdir`를 실제 `frames/train/...` 경로로 풀어줍니다. 따라서 `sft/data/frames/` 아래에 이미지가 정리돼 있으면 그대로 사용할 수 있습니다.
+
 체크포인트/어댑터는 모드에 따라 아래에 저장됩니다.
 
 - `outputs/qwen25vl3b_lora_sft_length`

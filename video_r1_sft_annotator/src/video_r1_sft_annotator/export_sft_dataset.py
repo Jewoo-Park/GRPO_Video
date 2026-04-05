@@ -165,6 +165,9 @@ def export_from_generated(
         question = str(row.get("question") or "")
         options = [str(opt) for opt in (row.get("options") or [])]
         instruction = build_question_with_options(question=question, options=options)
+        if not instruction:
+            stats["skip_missing_instruction"] += 1
+            continue
 
         gold_answer = normalize_answer_text(str(row.get("gold_answer") or ""))
         answer_raw = str(row.get("answer_raw") or "").strip()
@@ -240,6 +243,9 @@ def export_from_generated_granularity(
         question = str(row.get("question") or "")
         options = [str(opt) for opt in (row.get("options") or [])]
         instruction = build_question_with_options(question=question, options=options)
+        if not instruction:
+            stats["skip_missing_instruction"] += 1
+            continue
 
         reasoning_type = str(
             row.get("granularity_type")

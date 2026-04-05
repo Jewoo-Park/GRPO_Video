@@ -252,6 +252,23 @@ GRPO 학습 핵심 코드입니다.
 ]
 ```
 
+현재 raw annotation JSONL을 먼저 만들고 나중에 SFT용으로 후처리하는 workflow도 지원합니다. 예를 들어 `sft/data/generated_length_*.jsonl`, `sft/data/generated_granulity_*.jsonl`처럼 raw 파일이 있고 프레임이 `sft/data/frames/` 아래에 있다면:
+
+```bash
+cd sft
+python scripts/prepare_sft_dataset.py \
+  --mode length \
+  --input data/generated_length_0_500.jsonl \
+  --output data/video_r1_length_sft.jsonl
+
+python scripts/prepare_sft_dataset.py \
+  --mode perspective \
+  --input data/generated_granulity_0_1000.jsonl \
+  --output data/video_r1_perspective_sft.jsonl
+```
+
+이렇게 최종 `instruction / input / output / frames` JSONL로 변환한 뒤 바로 SFT를 실행하면 됩니다.
+
 또는 Dataset 2처럼 추론 관점까지 직접 예측하는 형식:
 
 ```json
