@@ -9,7 +9,7 @@ SFT_MODE="${SFT_MODE:-length}"
 CONFIG_PATH="${CONFIG_PATH:-}"
 MASTER_PORT="${MASTER_PORT:-12355}"
 MERGE_AFTER_TRAIN="${MERGE_AFTER_TRAIN:-true}"
-USE_VISION="${USE_VISION:-}"
+USE_VISION="${USE_VISION:-true}"
 
 if [[ -z "${CONFIG_PATH}" ]]; then
   case "${SFT_MODE}" in
@@ -24,15 +24,6 @@ if [[ -z "${CONFIG_PATH}" ]]; then
       exit 1
       ;;
   esac
-fi
-
-if [[ -z "${USE_VISION}" ]]; then
-  read -r -p "[SFT] 이미지/프레임 입력을 사용할까요? [y/N]: " USE_VISION_REPLY
-  if [[ "${USE_VISION_REPLY,,}" =~ ^(y|yes)$ ]]; then
-    USE_VISION="true"
-  else
-    USE_VISION="false"
-  fi
 fi
 
 if [[ -n "${NUM_GPUS:-}" ]]; then

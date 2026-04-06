@@ -1,0 +1,4 @@
+model_name_or_path: ./outputs/qwen25vl3b_lora_merged_perspective
+adapter_name_or_path: ../src/r1-v/outputs/video_r1_uvb_grpo_answer_only
+export_dir: ../src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged_perspective
+remap_adapter_keys: true

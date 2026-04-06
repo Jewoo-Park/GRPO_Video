@@ -82,7 +82,7 @@ pip install flash-attn --no-build-isolation --no-binary :all:
 
 ## 4단계: merge 설정 파일 확인
 
-예를 들어 length SFT adapter를 merge하려면 `sft/configs/merge_lora_qwen25vl3b.yaml` 또는 그에 준하는 설정에서 아래 세 값을 맞춘다.
+예를 들어 length SFT adapter를 merge하려면 `sft/configs/merge_lora_qwen25vl3b_length.yaml` 또는 그에 준하는 설정에서 아래 세 값을 맞춘다.
 
 ```yaml
 model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
@@ -107,14 +107,14 @@ export_dir: ./outputs/qwen25vl3b_lora_merged_perspective
 
 ```bash
 cd /workspace/GRPO_Video/sft
-CONFIG_PATH=configs/merge_lora_qwen25vl3b.yaml bash scripts/run_merge.sh
+SFT_MODE=length bash scripts/run_merge.sh
 ```
 
-원하는 adapter가 length인지 perspective인지에 맞게 `CONFIG_PATH`의 경로만 바꾸면 된다.
+원하는 adapter가 perspective라면 `SFT_MODE=perspective`로 바꾸면 된다.
 
 정상 진행 시 출력:
 ```
-[SFT-MERGE] config: configs/merge_lora_qwen25vl3b.yaml
+[SFT-MERGE] config: configs/merge_lora_qwen25vl3b_length.yaml
 Loading checkpoint shards: 100%|███████| 2/2 [...]
 # (경고/로그 없이) 프롬프트 복귀
 ```

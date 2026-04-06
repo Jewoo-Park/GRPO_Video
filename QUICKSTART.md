@@ -173,8 +173,7 @@ SFT LoRA adapter를 base model에 merge해서, 이후 GRPO의 시작 모델로 �
 
 ```bash
 cd sft
-CONFIG_PATH=configs/merge_lora_qwen25vl3b.yaml \
-bash scripts/run_merge.sh
+SFT_MODE=length bash scripts/run_merge.sh
 ```
 
 기본 merge 결과:
@@ -223,10 +222,11 @@ src/r1-v/outputs/video_r1_uvb_grpo_answer_only/
 
 GRPO도 기본 실행이 LoRA/PEFT 기반이므로, 최종 추론용 모델이 필요하면 merge를 한 번 더 하는 것이 안전하다.
 
-현재 레포에는 예시 설정 파일이 하나 있다.
+현재 레포에는 기본 설정 파일이 두 개 있다.
 
 ```text
-sft/configs/merge_lora_grpo_run12.yaml
+sft/configs/merge_lora_grpo_length.yaml
+sft/configs/merge_lora_grpo_perspective.yaml
 ```
 
 이 파일의 의미는 다음과 같다.
@@ -235,12 +235,12 @@ sft/configs/merge_lora_grpo_run12.yaml
 - `adapter_name_or_path`: Step 4의 GRPO output directory
 - `export_dir`: 최종 merged GRPO model directory
 
-예시 설정:
+length 기준 예시 설정:
 
 ```yaml
 model_name_or_path: /absolute/path/to/sft/outputs/qwen25vl3b_lora_merged_length
 adapter_name_or_path: /absolute/path/to/src/r1-v/outputs/video_r1_uvb_grpo_answer_only
-export_dir: /absolute/path/to/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged
+export_dir: /absolute/path/to/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged_length
 remap_adapter_keys: true
 ```
 
@@ -248,14 +248,13 @@ remap_adapter_keys: true
 
 ```bash
 cd sft
-CONFIG_PATH=configs/merge_lora_grpo_run12.yaml \
-bash scripts/run_merge.sh
+MERGE_STAGE=grpo SFT_MODE=length bash scripts/run_merge.sh
 ```
 
 merge 결과 예시:
 
 ```text
-src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged/
+src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged_length/
 ```
 
 이 디렉터리를 Step 6의 최종 평가 모델로 사용하면 된다.

@@ -12,7 +12,8 @@
 - `data/`: SFT 데이터셋(JSON)
 - `configs/train_lora_qwen25vl3b_length.yaml`: Dataset 1 학습 설정
 - `configs/train_lora_qwen25vl3b_perspective.yaml`: Dataset 2 학습 설정
-- `configs/merge_lora_qwen25vl3b.yaml`: LoRA 병합 설정
+- `configs/merge_lora_qwen25vl3b_length.yaml`: length SFT 병합 설정
+- `configs/merge_lora_qwen25vl3b_perspective.yaml`: perspective SFT 병합 설정
 - `scripts/train_sft.py`: 학습 스크립트
 - `scripts/merge_lora.py`: LoRA 병합 스크립트
 - `scripts/run_pipeline.sh`: SFT -> merge 연속 실행 스크립트
@@ -74,21 +75,28 @@ python scripts/prepare_sft_dataset.py \
 - `outputs/qwen25vl3b_lora_sft_length`
 - `outputs/qwen25vl3b_lora_sft_perspective`
 
-`bash scripts/run_train.sh`는 실행 시 이미지/프레임 입력 사용 여부를 직접 묻습니다.
+기본적으로 `bash scripts/run_train.sh`와 `bash scripts/run_pipeline.sh`는 `USE_VISION=true`로 실행됩니다.
 
 ## 3) Merge LoRA adapter
 
 ```bash
 cd sft
-python scripts/merge_lora.py --config configs/merge_lora_qwen25vl3b.yaml
+python scripts/merge_lora.py --config configs/merge_lora_qwen25vl3b_length.yaml
 # or
-bash scripts/run_merge.sh
+SFT_MODE=length bash scripts/run_merge.sh
 ```
 
 병합 모델도 모드에 따라 아래에 저장됩니다.
 
 - `outputs/qwen25vl3b_lora_merged_length`
 - `outputs/qwen25vl3b_lora_merged_perspective`
+
+`run_merge.sh`는 기본적으로:
+
+- `MERGE_STAGE=sft` + `SFT_MODE=length` -> `configs/merge_lora_qwen25vl3b_length.yaml`
+- `MERGE_STAGE=sft` + `SFT_MODE=perspective` -> `configs/merge_lora_qwen25vl3b_perspective.yaml`
+- `MERGE_STAGE=grpo` + `SFT_MODE=length` -> `configs/merge_lora_grpo_length.yaml`
+- `MERGE_STAGE=grpo` + `SFT_MODE=perspective` -> `configs/merge_lora_grpo_perspective.yaml`
 
 ## 4) Train + Merge 한 번에 실행
 

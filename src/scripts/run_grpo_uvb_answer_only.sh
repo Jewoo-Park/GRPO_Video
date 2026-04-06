@@ -9,7 +9,7 @@ export DEBUG_MODE="true"
 export LOG_PATH="./logs/video_r1_uvb_grpo_answer_only.log"
 mkdir -p ./logs
 
-QWEN_PATH="${QWEN_PATH:-Qwen/Qwen2.5-VL-3B-Instruct}"
+QWEN_PATH="${QWEN_PATH:-../../sft/outputs/qwen25vl3b_lora_merged_length}"
 TRAIN_FILE="${TRAIN_FILE:-../../data/video_r1/grpo/video_r1_grpo_train.jsonl}"
 TEST_FILE="${TEST_FILE:-../../data/urban_video_bench/grpo/uvb_grpo_test.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-./outputs/video_r1_uvb_grpo_answer_only}"
