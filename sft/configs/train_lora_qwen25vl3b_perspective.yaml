@@ -1,8 +1,8 @@
-model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
+model_name_or_path: Qwen/Qwen2.5-VL-7B-Instruct
 train_files:
   - ./data/video_r1_perspective_sft.jsonl
-output_dir: ./outputs/qwen25vl3b_lora_sft_perspective
-merge_output_dir: ./outputs/qwen25vl3b_lora_merged_perspective
+output_dir: ./outputs/qwen25vl7b_lora_sft_perspective
+merge_output_dir: ./outputs/qwen25vl7b_lora_merged_perspective
 
 max_length: 4096
 val_size: 0.05

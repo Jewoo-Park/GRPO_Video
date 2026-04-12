@@ -17,7 +17,7 @@
 - Test benchmark: `Urban Video Bench`
 - Additional benchmark 1: `VideoMMMU`
 - Additional benchmark 2: `MMVU (multiple-choice only)`
-- SFT base model: `Qwen/Qwen2.5-VL-3B-Instruct`
+- SFT base model: `Qwen/Qwen2.5-VL-7B-Instruct`
 
 주의:
 
@@ -160,10 +160,10 @@ bash scripts/run_train.sh
 산출물:
 
 ```text
-sft/outputs/qwen25vl3b_lora_sft_length/
+sft/outputs/qwen25vl7b_lora_sft_length/
 ```
 
-Perspective를 돌렸다면 산출물은 `sft/outputs/qwen25vl3b_lora_sft_perspective/`가 된다.
+Perspective를 돌렸다면 산출물은 `sft/outputs/qwen25vl7b_lora_sft_perspective/`가 된다.
 
 ---
 
@@ -179,26 +179,29 @@ SFT_MODE=length bash scripts/run_merge.sh
 기본 merge 결과:
 
 ```text
-sft/outputs/qwen25vl3b_lora_merged_length/
+sft/outputs/qwen25vl7b_lora_merged_length/
 ```
 
-Perspective를 merge했다면 `sft/outputs/qwen25vl3b_lora_merged_perspective/`가 된다.
+Perspective를 merge했다면 `sft/outputs/qwen25vl7b_lora_merged_perspective/`가 된다.
 
 ---
 
 ## 4. Video-R1을 통한 GRPO 훈련
 
-레포 루트에서 실행:
+레포 루트에서 실행 (scratch 병합 모델·베이스 경로는 이 계정 기준 실측값):
 
 ```bash
-QWEN_PATH="$(pwd)/sft/outputs/qwen25vl3b_lora_merged_length" \
+cd /home/users/ntu/n2500182/workspace_JWP/repos/GRPO_Video_2
+source /home/users/ntu/n2500182/scratch/.venv_realign/bin/activate
+export QWEN_PATH="/scratch/users/ntu/n2500182/models/qwen25vl7b_lora_merged_length"
+export QWEN_BASE_PATH="/scratch/users/ntu/n2500182/models/Qwen2.5-VL-7B-Instruct"
 TRAIN_FILE="$(pwd)/data/video_r1/grpo/video_r1_grpo_train.jsonl" \
 TEST_FILE="$(pwd)/data/urban_video_bench/grpo/uvb_grpo_test.jsonl" \
-OUTPUT_DIR="$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only" \
+OUTPUT_DIR="$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_lora" \
 NUM_GPUS=2 \
 TRAIN_NUM_GPUS=1 \
 CUDA_VISIBLE_DEVICES=0,1 \
-bash src/scripts/run_grpo_uvb_answer_only.sh
+bash src/scripts/run_grpo_answer_only_lora.sh
 ```
 
 설명:
@@ -213,7 +216,7 @@ bash src/scripts/run_grpo_uvb_answer_only.sh
 주요 산출물:
 
 ```text
-src/r1-v/outputs/video_r1_uvb_grpo_answer_only/
+src/r1-v/outputs/video_r1_uvb_grpo_answer_only_lora/
 ```
 
 ---
@@ -235,12 +238,12 @@ sft/configs/merge_lora_grpo_perspective.yaml
 - `adapter_name_or_path`: Step 4의 GRPO output directory
 - `export_dir`: 최종 merged GRPO model directory
 
-length 기준 예시 설정:
+length 기준 설정 (경로는 아래 그대로 쓰거나, 본인 산출물 디렉터리로만 바꿈):
 
 ```yaml
-model_name_or_path: /absolute/path/to/sft/outputs/qwen25vl3b_lora_merged_length
-adapter_name_or_path: /absolute/path/to/src/r1-v/outputs/video_r1_uvb_grpo_answer_only
-export_dir: /absolute/path/to/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged_length
+model_name_or_path: /scratch/users/ntu/n2500182/models/qwen25vl7b_lora_merged_length
+adapter_name_or_path: /home/users/ntu/n2500182/workspace_JWP/repos/GRPO_Video_2/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_lora
+export_dir: /home/users/ntu/n2500182/workspace_JWP/repos/GRPO_Video_2/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_lora_merged_length
 remap_adapter_keys: true
 ```
 
@@ -254,40 +257,74 @@ MERGE_STAGE=grpo SFT_MODE=length bash scripts/run_merge.sh
 merge 결과 예시:
 
 ```text
-src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged_length/
+src/r1-v/outputs/video_r1_uvb_grpo_answer_only_lora_merged_length/
 ```
 
 이 디렉터리를 Step 6의 최종 평가 모델로 사용하면 된다.
 
 ---
 
-## 6. UVB Benchmark를 통한 검증
+## 6. 벤치마크 평가
+
+평가 스크립트는 3개 데이터셋 각각 별도로 존재한다.
+
+| 스크립트 | 데이터셋 | 정답 선택지 | 비고 |
+|---|---|---|---|
+| `src/eval/uvb_eval_only.py` | Urban Video Bench | A~G | |
+| `src/eval/videommmu_eval_only.py` | VideoMMMU | A~J | `<image N>` 태그 자동 제거 |
+| `src/eval/mmvu_eval_only.py` | MMVU | A~E | |
+
+`--save-preds` / `--save-json` 인자를 생략하면 자동으로 모델 디렉터리 안에 타임스탬프 기반 파일로 저장된다.
 
 ### 6-1. GRPO 훈련 중 자동 검증
 
-`run_grpo_uvb_answer_only.sh`에 `TEST_FILE`이 지정되어 있으면, 학습 과정에서 UVB test를 같이 사용한다.
+`run_grpo_answer_only_lora.sh`에 `TEST_FILE`이 지정되어 있으면, 학습 과정에서 UVB test를 같이 사용한다.
 
 즉 Step 4 자체가 이미 `Video-R1 train + UVB test` 구조다.
 
-### 6-2. 별도 평가
-
-최종 merged GRPO model로 UVB benchmark만 다시 평가하려면:
+### 6-2. UVB 별도 평가
 
 ```bash
+MERGED="$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_lora_merged_length"
 python src/eval/uvb_eval_only.py \
-  --model "$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged" \
+  --model "${MERGED}" \
   --test-file "$(pwd)/data/urban_video_bench/grpo/uvb_grpo_test.jsonl" \
   --device cuda:0 \
-  --gpu-memory-utilization 0.6 \
-  --save-preds "$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged/test_predictions.jsonl" \
-  --save-json "$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged/test_metrics.json"
+  --gpu-memory-utilization 0.6
 ```
 
-대표 출력:
+### 6-3. VideoMMMU 별도 평가
+
+```bash
+MERGED="$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_lora_merged_length"
+python src/eval/videommmu_eval_only.py \
+  --model "${MERGED}" \
+  --test-file "$(pwd)/data/video_mmmu/grpo/videommmu_grpo_test.jsonl" \
+  --device cuda:0 \
+  --gpu-memory-utilization 0.6
+```
+
+### 6-4. MMVU 별도 평가
+
+```bash
+MERGED="$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_lora_merged_length"
+python src/eval/mmvu_eval_only.py \
+  --model "${MERGED}" \
+  --test-file "$(pwd)/data/mmvu/grpo/mmvu_grpo_test.jsonl" \
+  --device cuda:0 \
+  --gpu-memory-utilization 0.6
+```
+
+공통 출력 지표:
 
 - `answer_accuracy`
 - `answer_format_rate`
 - `reasoning_present_rate`
+
+산출 파일 (모델 디렉터리 안에 자동 저장):
+
+- `{dataset}_predictions_eval_<ts>.jsonl` — 샘플별 `pred_raw` 포함
+- `{dataset}_metrics_eval_<ts>.json` — 지표 + 전체 결과 통합
 
 ---
 
@@ -309,18 +346,18 @@ cd sft
 SFT_MODE=length USE_VISION=true CUDA_VISIBLE_DEVICES=0,1 bash scripts/run_train.sh
 
 # 3. SFT merge
-CONFIG_PATH=configs/merge_lora_qwen25vl3b.yaml bash scripts/run_merge.sh
+CONFIG_PATH=configs/merge_lora_qwen25vl7b.yaml bash scripts/run_merge.sh
 cd ..
 
 # 4. GRPO
-QWEN_PATH="$(pwd)/sft/outputs/qwen25vl3b_lora_merged_length" \
+QWEN_PATH="$(pwd)/sft/outputs/qwen25vl7b_lora_merged_length" \
 TRAIN_FILE="$(pwd)/data/video_r1/grpo/video_r1_grpo_train.jsonl" \
 TEST_FILE="$(pwd)/data/urban_video_bench/grpo/uvb_grpo_test.jsonl" \
-OUTPUT_DIR="$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only" \
+OUTPUT_DIR="$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_lora" \
 NUM_GPUS=2 \
 TRAIN_NUM_GPUS=1 \
 CUDA_VISIBLE_DEVICES=0,1 \
-bash src/scripts/run_grpo_uvb_answer_only.sh
+bash src/scripts/run_grpo_answer_only_lora.sh
 
 # 5. GRPO merge
 cd sft
@@ -329,7 +366,7 @@ cd ..
 
 # 6. UVB eval
 python src/eval/uvb_eval_only.py \
-  --model "$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged" \
+  --model "$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_lora_merged_length" \
   --test-file "$(pwd)/data/urban_video_bench/grpo/uvb_grpo_test.jsonl" \
   --device cuda:0
 ```
@@ -345,9 +382,9 @@ python src/eval/uvb_eval_only.py \
 
 모델:
 
-- SFT merged model: `sft/outputs/qwen25vl3b_lora_merged_length/` 또는 `sft/outputs/qwen25vl3b_lora_merged_perspective/`
-- GRPO adapter output: `src/r1-v/outputs/video_r1_uvb_grpo_answer_only/`
-- GRPO merged model: `src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged/`
+- SFT merged model: `sft/outputs/qwen25vl7b_lora_merged_length/` 또는 `sft/outputs/qwen25vl7b_lora_merged_perspective/`
+- GRPO adapter output: `src/r1-v/outputs/video_r1_uvb_grpo_answer_only_lora/`
+- GRPO merged model: `src/r1-v/outputs/video_r1_uvb_grpo_answer_only_lora_merged_length/` (또는 config에 맞는 `export_dir`)
 
 한 줄 요약:
 

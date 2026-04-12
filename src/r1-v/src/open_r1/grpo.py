@@ -36,9 +36,16 @@ class GRPOVideoScriptArguments(ScriptArguments):
         default=None,
         metadata={"help": "Optional weight override for answer_format reward"},
     )
+    train_video_only: bool = field(
+        default=False,
+        metadata={
+            "help": "If true, drop train rows whose video_id is a static image path (.png/.jpg/...), "
+            "keeping rows that look like real video clips (e.g. .mp4). Test/eval split is unchanged."
+        },
+    )
 
 
-GRPOUVBScriptArguments = GRPOVideoScriptArguments
+GRPOScriptArguments = GRPOVideoScriptArguments
 
 
 ## 답변 파싱 함수
@@ -72,6 +79,17 @@ def _normalize(text: str) -> str:
     text = text.lower().strip()
     text = re.sub(r"\s+", " ", text)
     return text
+
+
+# Train JSONL mixes video clips (.mp4, …) with image-only QA rows (video_id ending in .png/.jpg, …).
+_STATIC_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")
+
+
+def _train_row_is_video_clip(example: dict) -> bool:
+    vid = str(example.get("video_id", "") or "").strip().lower()
+    if not vid:
+        return True
+    return not any(vid.endswith(sfx) for sfx in _STATIC_IMAGE_SUFFIXES)
 
 
 def answer_accuracy_reward(completions, solution, **kwargs):
@@ -202,7 +220,15 @@ def main(script_args, training_args, model_args):
     training_args.model_init_kwargs = model_init_kwargs
 
     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
-    reward_weights = [1.0] * len(script_args.reward_funcs)
+    # Default reward weights when the user does not specify any overrides.
+    # We bias toward answer accuracy while still enforcing output format.
+    default_weight_by_name = {
+        "answer_accuracy": 0.8,
+        "answer_format": 0.2,
+    }
+    reward_weights = [
+        float(default_weight_by_name.get(name, 1.0)) for name in script_args.reward_funcs
+    ]
     if script_args.reward_weights.strip():
         parsed = [x.strip() for x in script_args.reward_weights.split(",") if x.strip()]
         if len(parsed) != len(reward_weights):
@@ -224,6 +250,19 @@ def main(script_args, training_args, model_args):
     if script_args.test_file:
         data_files["test"] = script_args.test_file
     dataset = load_dataset("json", data_files=data_files)
+
+    if script_args.train_video_only:
+        n_before = len(dataset["train"])
+        dataset["train"] = dataset["train"].filter(_train_row_is_video_clip)
+        n_after = len(dataset["train"])
+        print(
+            f"[VIDEO-GRPO] train_video_only=True: train rows {n_after}/{n_before} "
+            f"(dropped {n_before - n_after} static-image rows by video_id suffix)."
+        )
+        if n_after == 0:
+            raise ValueError(
+                "train_video_only removed all train rows. Check train JSONL or disable --train_video_only."
+            )
 
     def resolve_frames_for_split(split_name: str, base_jsonl_path: Optional[str]) -> None:
         if split_name not in dataset or not base_jsonl_path:
@@ -282,7 +321,14 @@ def main(script_args, training_args, model_args):
         reward_weights=reward_weights,
     )
 
-    trainer.train()
+    # GRPOConfig inherits TrainingArguments, which already defines --resume_from_checkpoint (do not duplicate on ScriptArguments).
+    resume_ckpt = getattr(training_args, "resume_from_checkpoint", None)
+    if resume_ckpt:
+        resume_ckpt = os.path.abspath(os.path.expanduser(str(resume_ckpt)))
+        if not os.path.isdir(resume_ckpt):
+            raise FileNotFoundError(f"resume_from_checkpoint is not a directory: {resume_ckpt}")
+
+    trainer.train(resume_from_checkpoint=resume_ckpt)
     trainer.save_model(training_args.output_dir)
 
     if script_args.test_file and "test" in dataset:

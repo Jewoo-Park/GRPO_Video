@@ -1,4 +1,4 @@
-model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
-adapter_name_or_path: ./outputs/qwen25vl3b_lora_sft_perspective
-export_dir: ./outputs/qwen25vl3b_lora_merged_perspective
+model_name_or_path: Qwen/Qwen2.5-VL-7B-Instruct
+adapter_name_or_path: ./outputs/qwen25vl7b_lora_sft_perspective
+export_dir: ./outputs/qwen25vl7b_lora_merged_perspective
 remap_adapter_keys: true

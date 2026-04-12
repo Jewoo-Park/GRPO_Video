@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 import textwrap
 from collections import defaultdict
@@ -51,6 +52,11 @@ from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 from PIL import Image
 import copy
 
+from open_r1.trainer.grpo_log_utils import format_grpo_train_metrics_line
+from open_r1.trainer.qwen25_config_utils import ensure_qwen25_rope_scaling
+
+logger = logging.getLogger(__name__)
+
 
 def _coerce_qwen25_text_config(cfg: Any) -> Any:
     """Normalize Qwen2.5-VL text config for transformers compatibility."""
@@ -86,6 +92,7 @@ def _coerce_qwen25_text_config(cfg: Any) -> Any:
         if value is not None:
             setattr(cfg, field_name, value)
 
+    ensure_qwen25_rope_scaling(cfg)
     return cfg
 
 
@@ -320,7 +327,25 @@ class Qwen2VLGRPOTrainer(Trainer):
                 or "Qwen2.5-VL" in model_id
             )
             if is_multimodal_model:
-                processing_class = AutoProcessor.from_pretrained(model_id)
+                proc_id = os.environ.get("PROCESSOR_PATH", "").strip() or model_id
+                if proc_id != model_id and (
+                    "/path/to" in proc_id
+                    or "/.../" in proc_id
+                    or "your_actual_subdir" in proc_id
+                ):
+                    logger.warning(
+                        "PROCESSOR_PATH looks like a documentation placeholder (%s); using model weights path for AutoProcessor.",
+                        proc_id,
+                    )
+                    proc_id = model_id
+                proc_kw: dict = {"trust_remote_code": True}
+                if os.environ.get("PROCESSOR_LOCAL_FILES_ONLY", "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                ):
+                    proc_kw["local_files_only"] = True
+                processing_class = AutoProcessor.from_pretrained(proc_id, **proc_kw)
                 pad_token_id = processing_class.tokenizer.pad_token_id
                 processing_class.pad_token_id = pad_token_id
                 processing_class.eos_token_id = processing_class.tokenizer.eos_token_id
@@ -609,7 +634,20 @@ class Qwen2VLGRPOTrainer(Trainer):
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         metrics = {key: sum(val) / len(val) for key, val in self._metrics.items()}  # average the metrics
+        if logs and next(iter(logs.keys())).startswith("eval_"):
+            metrics = {f"eval_{key}": val for key, val in metrics.items()}
         logs = {**logs, **metrics}
+        if self.accelerator.is_main_process and logs:
+            first_key = next(iter(logs.keys()))
+            if not first_key.startswith("eval_"):
+                logger.info(format_grpo_train_metrics_line(logs, self.state.global_step))
+            else:
+                eval_flat = {k[5:]: v for k, v in logs.items() if k.startswith("eval_")}
+                if eval_flat:
+                    line = format_grpo_train_metrics_line(
+                        eval_flat, self.state.global_step
+                    )
+                    logger.info(line.replace("[GRPO]", "[GRPO eval]", 1))
         if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
             super().log(logs, start_time)
         else:  # transformers<=4.46

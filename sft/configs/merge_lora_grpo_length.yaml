@@ -1,4 +1,4 @@
-model_name_or_path: ./outputs/qwen25vl3b_lora_merged_length
-adapter_name_or_path: ../src/r1-v/outputs/video_r1_uvb_grpo_answer_only
-export_dir: ../src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged_length
+model_name_or_path: ./outputs/qwen25vl7b_lora_merged_length
+adapter_name_or_path: ../src/r1-v/outputs/video_r1_uvb_grpo_answer_only_lora
+export_dir: ../src/r1-v/outputs/video_r1_uvb_grpo_answer_only_lora_merged_length
 remap_adapter_keys: true

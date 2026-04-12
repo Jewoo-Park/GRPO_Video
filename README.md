@@ -1,733 +1,316 @@
 # GRPO_Video_2
 
-`Qwen/Qwen2.5-VL-3B-Instruct`를 기반으로, 다음 순서의 연구 파이프라인을 수행하기 위한 레포입니다.
+`Qwen2.5-VL-7B-Instruct`를 백본으로, **SFT(LoRA) → SFT merge → GRPO(LoRA) → GRPO merge → 벤치마크 추론** 순서의 연구 파이프라인을 담은 레포입니다.  
+GRPO는 `Video-R1` 계열 데이터를 공통 JSONL 포맷으로 두고, `open_r1` 기반 비디오 GRPO(`grpo_video`)와 vLLM 롤아웃을 사용합니다.
 
-1. SFT 데이터셋으로 LoRA SFT
-2. SFT LoRA 어댑터를 백본에 merge
-3. merge된 모델을 시작점으로 GRPO 수행
-4. GRPO LoRA 어댑터를 다시 merge
-5. 최종 모델을 비디오 벤치마크로 평가
-
-현재 레포는 특히 `Video-R1` 기반 GRPO 학습과 `Urban Video Bench`, `VideoMMMU`, `MMVU` 평가를 중심으로 구성되어 있습니다.
-
-이 README는 현재 코드 기준의 실제 구조와 실행 흐름을 국문으로 정리한 문서입니다.
+YAML·스크립트 파일명에 남아 있는 `3b` 표기는 과거 명명이며, **실제 기본 설정은 7B 모델**입니다.
 
 ---
 
-## 1. 이 레포가 하는 일
+## 1. 전체 구조와 데이터 흐름
 
-이 레포의 핵심 목적은 다음과 같습니다.
+### 1-1. 단계별 파이프라인
 
-- Qwen2.5-VL 계열 모델에 대해 SFT를 수행할 수 있게 함
-- SFT 결과를 merge하여 GRPO 시작 모델을 만듦
-- 비디오/멀티모달 GRPO 학습 데이터를 공통 JSONL 포맷으로 정리함
-- GRPO 학습 후 LoRA 어댑터만 저장함
-- 저장된 어댑터를 다시 merge하여 최종 추론용 모델을 만듦
-- 최종 모델을 여러 비디오 벤치마크로 평가함
+| 단계 | 입력 | 출력 | 비고 |
+|------|------|------|------|
+| **SFT** | Dataset 1 (length) 또는 Dataset 2 (perspective) JSONL + 프레임 | LoRA 어댑터 (`sft/outputs/qwen25vl7b_lora_sft_*`) | `sft/scripts/run_train.sh` 등 |
+| **SFT merge** | 백본 HF 가중치 + SFT LoRA | merge된 전체 가중치 (`…/qwen25vl7b_lora_merged_*`, 대용량은 scratch 권장) | `remap_adapter_keys: true` |
+| **GRPO** | merge 모델 + Video-R1 GRPO train JSONL | GRPO LoRA (`src/r1-v/outputs/…`) | vLLM + DeepSpeed, LoRA만 저장 |
+| **GRPO merge** | SFT merge 모델 + GRPO LoRA | 최종 추론용 merge 모델 | `merge_lora_grpo_*.yaml` |
+| **테스트** | 최종(또는 중간) 모델 + 벤치 JSONL | `test_predictions.jsonl` 등 | UVB / VideoMMMU / MMVU |
 
-즉 전체 철학은 다음과 같습니다.
-
-**여러 원천 데이터셋을 공통 포맷으로 맞춘 뒤, SFT와 GRPO를 단계적으로 수행하고, 마지막에는 merge된 단일 추론 모델로 검증한다.**
-
----
-
-## 2. 현재 지원하는 큰 흐름
-
-현재 코드 기준으로 지원되는 전체 흐름은 아래와 같습니다.
-
-### 2-1. SFT
-
-- 텍스트 SFT
-- 이미지/프레임을 포함한 멀티모달 SFT
-- 두 가지 SFT 목표 지원:
-  - `length`: `<ANSWER>`, `<COT>`, `<LONG_COT>` 길이 supervision
-  - `perspective`: `<REASONING_TYPE>`, `<REASONING>`, `<ANSWER>` supervision
-
-### 2-2. SFT merge
-
-- SFT LoRA 어댑터를 백본 `Qwen/Qwen2.5-VL-3B-Instruct`에 merge
-- 키 mismatch가 발생하는 경우를 위해 adapter remap 로직 내장
-
-### 2-3. GRPO
-
-- 시작 모델: SFT merge 결과물
-- 학습 데이터: `Video-R1` 기반 GRPO JSONL
-- 학습 결과: GRPO LoRA 어댑터
-- 생성은 vLLM 기반, 업데이트는 torch/deepspeed 기반
-
-### 2-4. 최종 merge
-
-- GRPO 어댑터를 SFT merge 모델 위에 다시 merge
-- 최종 추론용 모델 생성
-
-### 2-5. 평가
-
-- Urban Video Bench
-- VideoMMMU
-- MMVU
-
-위 3개 평가셋은 모두 공통 GRPO 입력 포맷으로 정리되어 있으며, 같은 방식으로 모델 입력에 연결됩니다.
-
----
-
-## 3. 현재 상태에서 중요한 전제
-
-이 문서를 보는 시점 기준으로 중요한 전제는 다음과 같습니다.
-
-- **SFT 데이터셋은 아직 별도로 준비되어 있지 않을 수 있음**
-- **GPU 서버에서 end-to-end 학습을 실제 실행한 것은 아님**
-- 따라서 현재는 “정적 코드 검토 + 문법 검증 + 데이터 파이프라인 검증”이 완료된 상태로 보는 것이 정확함
-
-즉,
-
-- 코드 구조는 SFT -> merge -> GRPO -> merge -> 평가로 이어지도록 정리되어 있음
-- 실제 대규모 GPU 서버에서 최종 실행 검증은 별도로 필요함
-
----
-
-## 4. 디렉터리 구조
-
-레포 주요 디렉터리는 다음과 같습니다.
+### 1-2. 디렉터리 개요
 
 ```text
 GRPO_Video_2/
-├─ data/
-├─ sft/
-├─ src/
-├─ video_r1_sft_annotator/
-├─ QUICKSTART.md
-├─ merge_readme.md
-├─ REPO_STRUCTURE_AND_REVIEW.md
-└─ setup.sh
+├── data/                    # 보통 scratch로 심볼릭 링크 (아래 §2)
+├── sft/                     # LoRA SFT, merge, SFT 데이터·YAML
+├── src/
+│   ├── r1-v/                # GRPO 학습 패키지 (open_r1)
+│   ├── eval/                # 데이터 준비·평가 보조 스크립트
+│   └── scripts/             # run_grpo_answer_only_lora.sh, check_environment.sh 등
+├── scripts/                 # HPC용 venv 설치·활성화 (run_setup_sft.sh, run_setup_grpo.sh …)
+├── setup.sh                 # GRPO 전용 의존성 설치 (SFT와 분리)
+├── merge_readme.md, QUICKSTART.md, sft/README.md
+└── README.md                # 본 문서
 ```
 
-### 4-1. `data/`
+### 1-3. 공통 GRPO JSONL 스키마
 
-학습/평가용 데이터가 저장됩니다.
+학습·평가용 데이터는 아래 키를 중심으로 맞춥니다.
 
-대표 구조:
+- `video_id`, `question_id`, `question_category`
+- `problem` (질문·선지 텍스트)
+- `frames` (프레임 이미지 경로 리스트)
+- `solution` (정답·태그, 예: `<ANSWER>B</ANSWER>`)
 
-```text
-data/
-├─ video_r1/
-│  ├─ raw/
-│  ├─ processed/
-│  └─ grpo/
-├─ urban_video_bench/
-│  ├─ raw/
-│  ├─ processed/
-│  └─ grpo/
-├─ video_mmmu/
-│  ├─ raw/
-│  ├─ processed/
-│  └─ grpo/
-└─ mmvu/
-   ├─ raw/
-   ├─ processed/
-   └─ grpo/
-```
-
-### 4-2. `sft/`
-
-SFT 관련 코드가 들어 있습니다.
-
-대표 파일:
-
-- `sft/scripts/train_sft.py`
-- `sft/scripts/merge_lora.py`
-- `sft/scripts/run_train.sh`
-- `sft/scripts/run_merge.sh`
-- `sft/scripts/run_pipeline.sh`
-- `sft/configs/train_lora_qwen25vl3b_length.yaml`
-- `sft/configs/train_lora_qwen25vl3b_perspective.yaml`
-- `sft/configs/merge_lora_qwen25vl3b.yaml`
-- `sft/configs/merge_lora_grpo_run12.yaml`
-
-### 4-3. `src/eval/`
-
-데이터 준비와 평가 관련 코드가 들어 있습니다.
-
-대표 파일:
-
-- `src/eval/prepare_video_r1_grpo.py`
-- `src/eval/prepare_uvb_pipeline.py`
-- `src/eval/prepare_videommmu.py`
-- `src/eval/prepare_mmvu.py`
-- `src/eval/data_to_grpo.py`
-- `src/eval/uvb_eval_only.py`
-
-### 4-4. `src/r1-v/src/open_r1/`
-
-GRPO 학습 핵심 코드입니다.
-
-대표 파일:
-
-- `src/r1-v/src/open_r1/grpo_video.py`
-- `src/r1-v/src/open_r1/grpo_uvb.py`
-- `src/r1-v/src/open_r1/trainer/grpo_trainer.py`
-- `src/r1-v/src/open_r1/trainer/vllm_grpo_trainer_modified.py`
-
-### 4-5. `src/scripts/`
-
-실행 스크립트 모음입니다.
-
-대표 파일:
-
-- `src/scripts/run_grpo_uvb_answer_only.sh`
-- `src/scripts/run_grpo_uvb_answer_only_lora.sh`
-- `src/scripts/prepare_all_grpo_data.sh`
-- `src/scripts/check_environment.sh`
-- `src/scripts/apply_rotary_dtype_hotfix.sh`
+동일 스키마로 **Video-R1 train**, **Urban Video Bench / VideoMMMU / MMVU** 테스트를 처리합니다.
 
 ---
 
-## 5. 공통 데이터 포맷
+## 2. 데이터 위치 (scratch · `data/` 링크)
 
-이 레포는 여러 데이터셋을 최종적으로 **공통 GRPO JSONL 포맷**으로 변환합니다.
+용량이 큰 JSONL·프레임·비디오는 **home/workspace 쿼터를 피하기 위해 scratch**에 두는 구성을 권장합니다.
 
-주요 키는 다음과 같습니다.
+이 체크아웃에서는 `GRPO_Video_2/data`가 예시로 다음에 연결될 수 있습니다.
 
-- `video_id`
-- `question_id`
-- `question_category`
-- `problem`
-- `frames`
-- `solution`
+- `…/GRPO_Video_2/data` → `…/scratch/GRPO_Video_2_data/data`
 
-예시:
+실제 경로는 `readlink -f data`로 확인하세요.
 
-```json
-{
-  "video_id": "sample_001",
-  "question_id": 1,
-  "question_category": "Perception",
-  "problem": "What is the person holding?\nA. Book\nB. Cup\nC. Phone\nD. Bag",
-  "frames": [
-    "../processed/frames/test/sample_001/frame_000.jpg",
-    "../processed/frames/test/sample_001/frame_001.jpg"
-  ],
-  "solution": "<ANSWER>B</ANSWER>"
-}
-```
+### 2-1. SFT용 (Dataset 1 · Dataset 2)
 
-이 포맷의 장점은 다음과 같습니다.
+| 목적 | 내용 | 비고 |
+|------|------|------|
+| **Dataset 1 (length)** | `<ANSWER>`, `<COT>`, `<LONG_COT>` 등 길이·형식 supervision | raw 예: `question`, `options`, `gold_answer`, `frame_subdir`, `answer_raw`, `cot_raw`, `long_cot_raw` |
+| **Dataset 2 (perspective)** | `<REASONING_TYPE>`, `<REASONING>`, `<ANSWER>` (추론 관점) | raw 예: `granularity_type`, `granularity_thinking_raw` 등 |
 
-- UVB, VideoMMMU, MMVU, Video-R1 train을 같은 입출력 인터페이스로 처리 가능
-- 학습/평가 로직이 데이터셋별로 갈라지지 않음
-- 최종 모델 입력을 모두 “프레임 기반 멀티모달 QA”로 통일 가능
-
----
-
-## 6. SFT 파이프라인
-
-### 6-1. 지원하는 SFT 데이터 형식
-
-현재 `sft/scripts/train_sft.py`는 두 종류를 처리할 수 있습니다.
-
-#### A. 텍스트 SFT
-
-형식:
-
-```json
-[
-  {
-    "instruction": "문제 설명",
-    "input": "추가 입력",
-    "output": "<ANSWER>A</ANSWER>"
-  }
-]
-```
-
-#### B. 멀티모달 SFT
-
-형식:
-
-```json
-[
-  {
-    "problem": "프레임을 보고 정답을 고르시오 ...",
-    "solution": "<COT>...</COT><ANSWER>B</ANSWER>",
-    "frames": ["frame_000.jpg", "frame_001.jpg"]
-  }
-]
-```
-
-현재 raw annotation JSONL을 먼저 만들고 나중에 SFT용으로 후처리하는 workflow도 지원합니다. 예를 들어 `sft/data/generated_length_*.jsonl`, `sft/data/generated_granulity_*.jsonl`처럼 raw 파일이 있고 프레임이 `sft/data/frames/` 아래에 있다면:
+raw JSONL을 학습용으로 바꿀 때:
 
 ```bash
 cd sft
-python scripts/prepare_sft_dataset.py \
-  --mode length \
-  --input data/generated_length_0_500.jsonl \
-  --output data/video_r1_length_sft.jsonl
-
-python scripts/prepare_sft_dataset.py \
-  --mode perspective \
-  --input data/generated_granulity_0_1000.jsonl \
-  --output data/video_r1_perspective_sft.jsonl
+python scripts/prepare_sft_dataset.py --mode length   --input data/generated_length.jsonl   --output data/video_r1_length_sft.jsonl
+python scripts/prepare_sft_dataset.py --mode perspective --input data/generated_granulity.jsonl --output data/video_r1_perspective_sft.jsonl
 ```
 
-이렇게 최종 `instruction / input / output / frames` JSONL로 변환한 뒤 바로 SFT를 실행하면 됩니다.
+기본 학습 YAML의 `train_files`는 예를 들어 `video_r1_length_sft_from_filtered.jsonl`, `video_r1_perspective_sft.jsonl` 등을 가리킵니다. **scratch에만 두었다면** 해당 YAML의 경로를 맞추거나 심볼릭 링크를 사용합니다.
 
-또는 Dataset 2처럼 추론 관점까지 직접 예측하는 형식:
+### 2-2. GRPO 학습용
 
-```json
-[
-  {
-    "instruction": "프레임을 보고 문제를 푸시오 ...",
-    "input": "",
-    "frames": ["frame_000.jpg", "frame_001.jpg"],
-    "output": "<REASONING_TYPE>TEMPORAL</REASONING_TYPE>\n<REASONING>...</REASONING>\n<ANSWER>B</ANSWER>"
-  }
-]
-```
+- **Train**: `data/video_r1/grpo/video_r1_grpo_train.jsonl` (Video-R1 전처리 결과)
 
-또는:
+### 2-3. 테스트 세트 (세 종)
 
-```json
-[
-  {
-    "problem": "이미지를 보고 답하시오 ...",
-    "solution": "<ANSWER>C</ANSWER>",
-    "image": "image_001.jpg"
-  }
-]
-```
-
-또는:
-
-```json
-[
-  {
-    "problem": "이미지들을 보고 답하시오 ...",
-    "solution": "<LONG_COT>...</LONG_COT><ANSWER>D</ANSWER>",
-    "images": ["img1.jpg", "img2.jpg"]
-  }
-]
-```
-
-상대경로는 **해당 JSON/JSONL 파일이 위치한 디렉터리 기준**으로 해석됩니다.
-
-### 6-2. 이미지 사용 여부
-
-SFT는 두 모드를 모두 지원합니다.
-
-- `USE_VISION=false`
-  - 텍스트만 사용
-- `USE_VISION=true`
-  - 이미지/프레임을 실제로 로드해서 사용
-
-실행 시 `run_train.sh` 또는 `run_pipeline.sh`가 직접 물어볼 수도 있고, 환경변수로 고정할 수도 있습니다.
-
-### 6-3. SFT LoRA target
-
-현재 기본 설정은:
-
-```yaml
-lora_target_modules: auto
-```
-
-이 의미는 다음과 같습니다.
-
-- 텍스트 SFT:
-  - 언어 모듈 중심으로 LoRA 적용
-- 비전 사용 SFT:
-  - 언어 + 비전 선형 모듈까지 포함하여 LoRA 적용
-
-즉 “이미지 사용 여부”에 따라 자동으로 더 넓은 범위의 모듈에 LoRA를 적용하도록 설계되어 있습니다.
-
-### 6-4. SFT 실행 명령
-
-가장 일반적인 실행:
-
-```bash
-cd sft
-bash scripts/run_pipeline.sh
-```
-
-이 명령은:
-
-1. 이미지/프레임 사용 여부를 물어봄
-2. SFT 수행
-3. 끝나면 자동으로 merge 수행
-
-텍스트만:
-
-```bash
-cd sft
-USE_VISION=false bash scripts/run_pipeline.sh
-```
-
-이미지/프레임 포함:
-
-```bash
-cd sft
-SFT_MODE=length USE_VISION=true bash scripts/run_pipeline.sh
-```
-
-학습만 하고 merge는 나중에:
-
-```bash
-cd sft
-SFT_MODE=length USE_VISION=true bash scripts/run_train.sh
-```
-
-### 6-5. SFT 결과물
-
-기본 출력은 SFT 모드에 따라 달라진다.
-
-- length:
-  - LoRA 어댑터: `sft/outputs/qwen25vl3b_lora_sft_length/`
-  - merge 결과: `sft/outputs/qwen25vl3b_lora_merged_length/`
-- perspective:
-  - LoRA 어댑터: `sft/outputs/qwen25vl3b_lora_sft_perspective/`
-  - merge 결과: `sft/outputs/qwen25vl3b_lora_merged_perspective/`
-
----
-
-## 7. SFT merge 파이프라인
-
-SFT 이후 LoRA 어댑터를 백본 모델에 병합합니다.
-
-관련 파일:
-
-- `sft/scripts/merge_lora.py`
-- `sft/configs/merge_lora_qwen25vl3b.yaml`
-
-예를 들어 length SFT용 merge 설정:
-
-```yaml
-model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
-adapter_name_or_path: ./outputs/qwen25vl3b_lora_sft_length
-export_dir: ./outputs/qwen25vl3b_lora_merged_length
-remap_adapter_keys: true
-```
-
-perspective SFT를 merge할 때는 adapter/export 경로만 `..._perspective`로 바꾸면 된다.
-
-### 왜 `remap_adapter_keys: true`가 중요한가
-
-Qwen2.5-VL 계열에서는 저장된 adapter key와 실제 backbone key가 다음 형태로 어긋나는 경우가 있습니다.
-
-- `language_model.layers`
-- `model.layers`
-- `visual.blocks`
-- `model.visual.blocks`
-
-이 레포는 merge 전에 adapter key를 remap해서 이런 mismatch를 줄이도록 구성되어 있습니다.
-
-즉, 과거에 있었던 “merge는 됐는데 실제 LoRA 가중치가 적용되지 않는” 문제를 막기 위한 장치입니다.
-
----
-
-## 8. GRPO 파이프라인
-
-### 8-1. 시작 모델
-
-GRPO는 기본적으로 **SFT를 merge한 모델**을 시작점으로 사용합니다.
-
-즉 순서는:
-
-1. 백본
-2. SFT LoRA 학습
-3. SFT LoRA merge
-4. merge된 모델을 GRPO 시작 모델로 사용
-
-### 8-2. 학습 데이터
-
-현재 학습용 주력 데이터는:
-
-- `data/video_r1/grpo/video_r1_grpo_train.jsonl`
-
-입니다.
-
-이 파일은 `Video-R1` 원본을 전처리하여 만든 공통 포맷입니다.
-
-### 8-3. 평가 데이터
-
-대표 평가셋:
+레포 기준 상대 경로( scratch `data` 루트와 동일):
 
 - `data/urban_video_bench/grpo/uvb_grpo_test.jsonl`
 - `data/video_mmmu/grpo/videommmu_grpo_test.jsonl`
 - `data/mmvu/grpo/mmvu_grpo_test.jsonl`
 
-### 8-4. 실행 스크립트
-
-대표 실행 스크립트:
-
-- `src/scripts/run_grpo_uvb_answer_only.sh`
-- `src/scripts/run_grpo_uvb_answer_only_lora.sh`
-
-실제로는 `TEST_FILE`만 바꾸면 UVB/MMMU/MMVU 모두 같은 구조로 사용 가능합니다.
-
-예시:
-
-```bash
-QWEN_PATH="$(pwd)/sft/outputs/qwen25vl3b_lora_merged_length" \
-TRAIN_FILE="$(pwd)/data/video_r1/grpo/video_r1_grpo_train.jsonl" \
-TEST_FILE="$(pwd)/data/urban_video_bench/grpo/uvb_grpo_test.jsonl" \
-OUTPUT_DIR="$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only" \
-NUM_GPUS=2 \
-TRAIN_NUM_GPUS=1 \
-CUDA_VISIBLE_DEVICES=0,1 \
-bash src/scripts/run_grpo_uvb_answer_only.sh
-```
-
-### 8-5. vLLM과 학습 GPU의 역할 분리
-
-이 레포의 GRPO 핵심은 다음과 같습니다.
-
-- 생성은 vLLM이 담당
-- loss 계산/업데이트는 torch/deepspeed가 담당
-
-가능하면 다음 구조를 권장합니다.
-
-- 예: GPU 4장
-  - 학습: 3장
-  - vLLM: 1장
-
-코드상으로는 vLLM을 별도 GPU에 올리도록 되어 있으며, 학습 step 사이에 최신 weight를 vLLM 엔진 쪽으로 다시 load합니다.
-
-즉 “추론은 빠르게”, “가중치 업데이트는 기존 training stack으로”라는 분리 구조입니다.
+데이터 준비 스크립트는 `sft/data/prepare_/` 등에 복사본이 있을 수 있으며, 원본 파이프라인은 `src/eval/` 및 레포 내 `prepare_*` 스크립트를 참고하면 됩니다.
 
 ---
 
-## 9. GRPO LoRA target 정책
+## 3. 환경 분리 원칙
 
-GRPO에서는 기본적으로 다음 target만 사용하는 것이 안전합니다.
+**SFT와 GRPO는 서로 다른 venv를 씁니다.** 한 venv에 `pip`로 섞이면 의존성이 깨지기 쉽습니다.
 
-```text
-q_proj k_proj v_proj o_proj
-```
+| 목적 | 최초 1회 설치 | 매 세션 활성화 | 기본 경로 |
+|------|----------------|----------------|-----------|
+| **SFT** | `bash scripts/run_setup_sft.sh` | `source scripts/hpc_activate_sft.sh` | `$HOME/scratch/.venv_sft` |
+| **GRPO** | `bash scripts/run_setup_grpo.sh` | `source scripts/hpc_activate_grpo.sh` | `$HOME/scratch/.venv_grpo` |
 
-이유:
+- `setup.sh`는 **GRPO용**으로 `run_setup_grpo.sh`에서 호출됩니다. **SFT 설치에 직접 쓰지 않습니다.**
+- (구버전) `run_setup_realign.sh` / `hpc_activate_realign.sh`는 동일 계열 실험용 별칭으로 남아 있을 수 있으며, **현재 권장 GRPO 경로는 `_grpo` 스크립트**입니다.
+- HPC에서는 **모듈 로드가 포함된** `hpc_activate_*.sh`로 활성화하는 것이 안전합니다. 모듈 없이 `~/.venv_sft/bin/activate`만 하면 `libpython` 오류가 날 수 있습니다.
 
-- `gate_proj`, `up_proj`, `down_proj`는 언어 모델뿐 아니라 visual encoder MLP에도 넓게 걸릴 수 있음
-- GRPO는 forward가 반복되기 때문에 activation memory가 더 쉽게 누적됨
-- 결과적으로 OOM 위험이 커짐
-
-현재 스크립트는 이 정책을 반영하도록 맞춰져 있습니다.
-
----
-
-## 10. 필수 운영 패치와 안정화 포인트
-
-이 레포는 과거 디버깅 결과를 반영해 몇 가지 중요한 안정화 포인트를 포함합니다.
-
-### 10-1. `use_cache=False`
-
-최신 transformers 환경에서는 기본 `use_cache=True`로 인해 `DynamicCache()`가 생성되고, Flash Attention 경로에서 padding 관련 오류가 날 수 있습니다.
-
-따라서 trainer의 per-token logprob 계산 경로에서는 `use_cache=False`를 강제로 사용합니다.
-
-반영 위치:
-
-- `src/r1-v/src/open_r1/trainer/vllm_grpo_trainer_modified.py`
-- `src/r1-v/src/open_r1/trainer/grpo_trainer.py`
-
-### 10-2. rotary dtype hotfix
-
-일부 환경에서는 `q.float()`와 `cos/sin`의 dtype mismatch 때문에 아래 오류가 날 수 있습니다.
-
-- `AssertionError: same dtype, got float32 and bfloat16`
-
-이를 위해 레포에는 site-packages를 직접 패치하는 스크립트가 포함되어 있습니다.
-
-관련 스크립트:
-
-- `src/scripts/apply_rotary_dtype_hotfix.sh`
-
-즉 이 버그는 “코드 안에 자동 반영”이 아니라, **필요한 환경에서 한 번 실행해 해결하는 방식**입니다.
-
-### 10-3. Attention implementation
-
-GRPO 스크립트 기본값은:
-
-```text
-flash_attention_2
-```
-
-입니다.
-
-이는 SDPA 대비 메모리 사용량을 줄여 긴 프레임 입력에서 OOM을 피하는 데 도움이 됩니다.
+`pip` 캐시는 기본적으로 `$HOME/scratch/pip_cache`를 쓰도록 맞춰 두었습니다.
 
 ---
 
-## 11. 최종 merge
+## 4. SFT 재현
 
-GRPO 완료 후에는 다시 LoRA 어댑터를 merge할 수 있습니다.
+작업 디렉터리는 **`sft/`** 기준입니다.
 
-관련 파일:
+### 4-1. 가상환경 (venv_sft)
 
-- `sft/configs/merge_lora_grpo_run12.yaml`
-- `sft/scripts/merge_lora.py`
+레포 루트에서:
 
-현재 기본 예시는:
-
-```yaml
-model_name_or_path: ./outputs/qwen25vl3b_lora_merged_length
-adapter_name_or_path: ../src/r1-v/outputs/uvb_grpo_run12
-export_dir: ../src/r1-v/outputs/uvb_grpo_run12_merged
-remap_adapter_keys: true
+```bash
+cd /path/to/GRPO_Video_2
+bash scripts/run_setup_sft.sh
 ```
 
-실제 실험 디렉터리에 맞게 `adapter_name_or_path`와 `export_dir`를 바꿔 쓰면 됩니다.
+GPU 노드에서 flash-attn까지 쓰려면 (예):
 
-즉 순서는:
+```bash
+module load cuda/12.2.2   # 사이트에 맞게
+INSTALL_FLASH_ATTN=true bash scripts/run_setup_sft.sh
+```
 
-1. SFT merge 모델 준비
-2. 그 모델로 GRPO 수행
-3. GRPO LoRA 어댑터 저장
-4. GRPO 어댑터를 다시 merge
-5. 최종 모델로 평가
+### 4-2. 활성화
+
+```bash
+module load cuda/12.2.2    # 학습 시 권장
+source /path/to/GRPO_Video_2/scripts/hpc_activate_sft.sh
+cd /path/to/GRPO_Video_2/sft
+```
+
+### 4-3. 학습 (Dataset 1 · Dataset 2)
+
+```bash
+# Length
+SFT_MODE=length USE_VISION=true bash scripts/run_train.sh
+
+# Perspective
+SFT_MODE=perspective USE_VISION=true bash scripts/run_train.sh
+```
+
+산출물 예:
+
+- `outputs/qwen25vl7b_lora_sft_length` / `outputs/qwen25vl7b_lora_sft_perspective`
+
+### 4-4. 백본 로드 후 SFT LoRA merge
+
+merge는 **다시 백본 `Qwen/Qwen2.5-VL-7B-Instruct`를 로드**하고 어댑터 가중치를 합칩니다.
+
+```bash
+cd sft
+SFT_MODE=length bash scripts/run_merge.sh
+# 또는
+python scripts/merge_lora.py --config configs/merge_lora_qwen25vl3b_length.yaml
+```
+
+`merge_lora_qwen25vl3b_*.yaml`에서 `export_dir`를 **scratch**로 두면 전체 가중치(~15GB+) 저장 시 쿼터 문제를 줄일 수 있습니다. 예:
+
+- `export_dir: /scratch/users/<USER>/models/qwen25vl7b_lora_merged_length`
+
+**`remap_adapter_keys: true`**는 Qwen2.5-VL에서 저장 키와 백본 키 불일치(`language_model.layers` vs `model.layers` 등)를 줄이기 위해 유지합니다.
 
 ---
 
-## 12. 평가 구조
+## 5. GRPO 재현
 
-### 12-1. 학습 중 test inference
+### 5-1. 시작 모델
 
-GRPO 스크립트에서 `TEST_FILE`이 지정되어 있으면, 학습 완료 후 `test_predictions.jsonl`이 자동 생성됩니다.
+- **`QWEN_PATH`**: SFT merge가 끝난 디렉터리 (전체 가중치).
+- **`QWEN_BASE_PATH` / `PROCESSOR_PATH`**: merged 트리만으로는 Qwen2.5-VL용 `AutoProcessor` JSON이 깨지는 경우가 있어, **깨끗한 HF 베이스**에서 프로세서만 읽도록 분리합니다.
 
-### 12-2. 별도 평가
-
-현재 별도 평가 스크립트는 UVB 이름으로 제공됩니다.
-
-- `src/eval/uvb_eval_only.py`
-
-하지만 실제 입력 형식은 공통 JSONL이라서, 같은 스키마를 쓰는 데이터에는 재사용 가능합니다.
-
-즉 현재 구조는:
-
-- 코드 이름은 UVB 전용처럼 보이지만
-- 실제 입력 인터페이스는 공통 프레임 기반 QA 포맷
-
-입니다.
-
----
-
-## 13. 데이터 준비 스크립트
-
-대표 데이터 준비 명령:
-
-### Video-R1 train
+`src/scripts/run_grpo_answer_only_lora.sh` 기본값 예(계정별로 수정):
 
 ```bash
-bash src/scripts/prepare_video_r1_grpo_data.sh
+export QWEN_PATH="/scratch/users/<USER>/models/qwen25vl7b_lora_merged_length"
+export QWEN_BASE_PATH="/scratch/users/<USER>/models/Qwen2.5-VL-7B-Instruct"
+# PROCESSOR_PATH는 기본으로 QWEN_BASE_PATH를 따름
 ```
 
-### UVB
+플레이스홀더 경로(`/path/to/...`, `...`)는 스크립트가 **실행 전에 거부**합니다.
+
+### 5-2. 가상환경 (venv_grpo)
 
 ```bash
-bash src/scripts/prepare_uvb_grpo_data.sh
+cd /path/to/GRPO_Video_2
+bash scripts/run_setup_grpo.sh
 ```
 
-### VideoMMMU
+flash-attn은 GPU 아키텍처에 맞게 빌드하려면 `run_setup_grpo.sh` 상단 주석의 `GRPO_CUDA_MODULE`, `TORCH_CUDA_ARCH_LIST` 등을 참고합니다.
+
+### 5-3. 활성화
 
 ```bash
-bash src/scripts/prepare_videommmu_grpo_data.sh
+export GRPO_CUDA_MODULE="cuda/12.2.2"   # DeepSpeed import용 nvcc 등
+source /path/to/GRPO_Video_2/scripts/hpc_activate_grpo.sh
 ```
 
-### MMVU
+`hpc_activate_grpo.sh`는 **venv의 `nvidia-nvjitlink` 휠 경로를 `LD_LIBRARY_PATH` 앞에 붙여** `__nvJitLinkComplete_12_4` 류 오류를 완화합니다.
+
+### 5-4. 데이터 확인
+
+- 학습 소스: 환경 변수 **`TRAIN_FILE`** (기본값은 `data/video_r1/grpo/video_r1_grpo_train.jsonl`을 `TRAIN_SOURCE`로 사용)
+- 스크립트는 `split_jsonl_train_eval.py`로 **train/eval 분할 JSONL**을 만들고, **기본**으로는 그 **eval 분할**을 테스트 JSONL로 넘깁니다.
+- **UVB / VideoMMMU / MMVU** 등 고정 벤치마크를 쓰려면 **`GRPO_TEST_FILE`**에 해당 JSONL 경로를 지정합니다. (미설정 시 train에서 뽑은 eval 분할을 사용)
 
 ```bash
-bash src/scripts/prepare_mmvu_grpo_data.sh
+export GRPO_TEST_FILE="$(pwd)/data/urban_video_bench/grpo/uvb_grpo_test.jsonl"
 ```
 
-### 한 번에 모두
+### 5-5. GRPO 실행
+
+레포 루트에서:
 
 ```bash
-bash src/scripts/prepare_all_grpo_data.sh
+cd /path/to/GRPO_Video_2
+source scripts/hpc_activate_grpo.sh
+
+export QWEN_PATH="/scratch/users/<USER>/models/qwen25vl7b_lora_merged_length"
+export QWEN_BASE_PATH="/scratch/users/<USER>/models/Qwen2.5-VL-7B-Instruct"
+export TRAIN_FILE="$(pwd)/data/video_r1/grpo/video_r1_grpo_train.jsonl"
+export OUTPUT_DIR="$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_lora"
+export NUM_GPUS=2
+export TRAIN_NUM_GPUS=1
+export CUDA_VISIBLE_DEVICES=0,1
+
+bash src/scripts/run_grpo_answer_only_lora.sh
 ```
 
----
+로그는 기본으로 `OUTPUT_DIR/training_log.txt`에 `tee`됩니다.
 
-## 14. 추천 실행 순서
-
-### 14-1. 환경 준비
+필요 시 이어하기:
 
 ```bash
-bash setup.sh
+export RESUME_FROM_CHECKPOINT="/path/to/.../checkpoint-500"
+bash src/scripts/run_grpo_answer_only_lora.sh
+```
+
+### 5-6. 오류 방지용으로 반영해 둔 사항 (요약)
+
+실행 전 점검:
+
+```bash
 bash src/scripts/check_environment.sh
+# 로그인 노드만: GRPO_CHECK_NO_GPU=1 bash src/scripts/check_environment.sh
 ```
 
-필요하면:
+학습 안정화·환경 이슈 대응:
 
-```bash
-bash src/scripts/apply_rotary_dtype_hotfix.sh
-```
+| 이슈 | 대응 |
+|------|------|
+| Qwen2.5-VL rotary에서 `float32` vs `bfloat16` assert | 스크립트가 기동 시 `apply_rotary_dtype_hotfix.sh` 실행 (`GRPO_APPLY_ROTARY_DTYPE_HOTFIX=false`로 끔) |
+| `DynamicCache` + Flash Attention padding 오류 | trainer 쪽에서 `use_cache=False` 경로 사용 |
+| GRPO 메모리 | LoRA 타깃을 `q_proj,k_proj,v_proj,o_proj`로 제한, `flash_attention_2` 기본, `MAX_PIXELS`/`MIN_PIXELS` 조정 |
+| 8bit 로드 후 가중치 초기화 오류 | `LOAD_IN_8BIT` 기본 `false` (필요 시에만 켬) |
+| NCCL/통신 불안정 | `NCCL_SAFE_MODE=true` 등 환경 변수 (스크립트 주석 참고) |
+| DeepSpeed `CUDA_HOME` | `GRPO_CUDA_MODULE` 또는 `nvcc`가 잡히도록 모듈 로드 |
 
-### 14-2. 데이터 준비
+### 5-7. GRPO LoRA를 SFT merge 모델에 merge
 
-```bash
-bash src/scripts/prepare_all_grpo_data.sh
-```
-
-### 14-3. SFT
-
-```bash
-cd sft
-SFT_MODE=length bash scripts/run_pipeline.sh
-```
-
-### 14-4. GRPO
-
-```bash
-cd ..
-QWEN_PATH="$(pwd)/sft/outputs/qwen25vl3b_lora_merged_length" \
-TRAIN_FILE="$(pwd)/data/video_r1/grpo/video_r1_grpo_train.jsonl" \
-TEST_FILE="$(pwd)/data/urban_video_bench/grpo/uvb_grpo_test.jsonl" \
-OUTPUT_DIR="$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only" \
-NUM_GPUS=2 \
-TRAIN_NUM_GPUS=1 \
-CUDA_VISIBLE_DEVICES=0,1 \
-bash src/scripts/run_grpo_uvb_answer_only.sh
-```
-
-### 14-5. 최종 merge
+`SFT merge 모델`이 베이스이고, 그 위에 학습된 **GRPO LoRA**를 다시 얹습니다.
 
 ```bash
 cd sft
-python scripts/merge_lora.py \
-  --model-name-or-path ./outputs/qwen25vl3b_lora_merged_length \
-  --adapter-name-or-path ../src/r1-v/outputs/video_r1_uvb_grpo_answer_only \
-  --export-dir ../src/r1-v/outputs/video_r1_uvb_grpo_answer_only_merged \
-  --remap-adapter-keys true
+# 예: length SFT merge → GRPO 출력
+python scripts/merge_lora.py --config configs/merge_lora_grpo_length.yaml
 ```
 
-### 14-6. 벤치마크 평가
-
-평가셋별로 `TEST_FILE`를 바꿔가며 실행하거나, 별도 eval 스크립트를 사용합니다.
+`merge_lora_grpo_length.yaml` / `merge_lora_grpo_perspective.yaml`에서 `adapter_name_or_path`, `export_dir`를 실제 출력 디렉터리에 맞게 수정합니다.
 
 ---
 
-## 15. 현재 기준으로 “되는 것”과 “아직 남은 것”
+## 6. 테스트 (세 벤치마크 추론)
 
-### 되는 것
+동일한 GRPO 런처에서 **`GRPO_TEST_FILE`만 바꿔** 세 번 실행하거나, 학습이 끝난 뒤 평가 전용 스크립트(`src/eval/uvb_eval_only.py` 등)로 공통 JSONL을 넣습니다.
 
-- SFT -> merge 흐름 정리
-- 텍스트 / 멀티모달 SFT 둘 다 지원
-- GRPO 데이터 포맷 통일
-- Video-R1 train + UVB/MMMU/MMVU test 데이터 준비 구조 정리
-- SFT merge 모델을 시작점으로 GRPO 수행 가능
-- GRPO 후 다시 merge 가능
+예 (Urban Video Bench):
 
-### 아직 남은 것
+```bash
+export GRPO_TEST_FILE="$(pwd)/data/urban_video_bench/grpo/uvb_grpo_test.jsonl"
+# QWEN_PATH, OUTPUT_DIR 등은 위와 동일하게
+bash src/scripts/run_grpo_answer_only_lora.sh
+```
 
-- 실제 GPU 서버에서 end-to-end 실행 검증
-- 실제 멀티모달 SFT 데이터셋으로 adapter save -> merge까지 실런
-- UVB/MMMU/MMVU를 완전히 공통화한 별도 eval wrapper 정리
+VideoMMMU / MMVU도 각각:
 
-즉 현재 상태를 한 줄로 요약하면:
+- `data/video_mmmu/grpo/videommmu_grpo_test.jsonl`
+- `data/mmvu/grpo/mmvu_grpo_test.jsonl`
 
-**코드 구조와 실행 흐름은 정리되어 있으며, 실제 대규모 서버에서의 최종 실험 검증만 남아 있다.**
+학습이 끝나면 `output_dir` 아래에 **`test_predictions.jsonl`**이 생성됩니다(`grpo.py`의 `write_test_predictions_jsonl`).
 
 ---
 
-## 16. 관련 문서
+## 7. 권장 실행 순서 (체크리스트)
 
-- [`QUICKSTART.md`](/Users/jw246/Desktop/NTU%20COSMO%20LAB/cloned%20Repos/GRPO_Video_2/QUICKSTART.md)
-- [`merge_readme.md`](/Users/jw246/Desktop/NTU%20COSMO%20LAB/cloned%20Repos/GRPO_Video_2/merge_readme.md)
-- [`sft/README.md`](/Users/jw246/Desktop/NTU%20COSMO%20LAB/cloned%20Repos/GRPO_Video_2/sft/README.md)
-- [`src/eval/README.md`](/Users/jw246/Desktop/NTU%20COSMO%20LAB/cloned%20Repos/GRPO_Video_2/src/eval/README.md)
-- [`REPO_STRUCTURE_AND_REVIEW.md`](/Users/jw246/Desktop/NTU%20COSMO%20LAB/cloned%20Repos/GRPO_Video_2/REPO_STRUCTURE_AND_REVIEW.md)
+1. `data`가 scratch를 가리키는지, SFT·GRPO JSONL·프레임이 있는지 확인  
+2. **SFT**: `run_setup_sft.sh` → `hpc_activate_sft.sh` → `run_train.sh` (length / perspective)  
+3. **SFT merge**: `run_merge.sh` 또는 `merge_lora.py` (필요 시 scratch `export_dir`)  
+4. **GRPO**: `run_setup_grpo.sh` → `hpc_activate_grpo.sh` → `run_grpo_answer_only_lora.sh` (`QWEN_PATH`, `QWEN_BASE_PATH`)  
+5. **GRPO merge**: `merge_lora_grpo_*.yaml`  
+6. **평가**: 세 `*_grpo_test.jsonl`에 대해 추론 실행  
+
+---
+
+## 8. 관련 문서
+
+- [`sft/README.md`](sft/README.md) — SFT·merge 상세  
+- [`merge_readme.md`](merge_readme.md) — merge 절차 보조  
+- [`QUICKSTART.md`](QUICKSTART.md) — 빠른 참고  
+- [`src/eval/README.md`](src/eval/README.md) — eval 데이터 준비(있는 경우)

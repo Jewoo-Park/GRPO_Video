@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import dataclasses
+import fcntl
 import json
 import math
 import os
@@ -22,6 +24,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+from transformers.trainer_callback import TrainerState
 
 
 DEFAULT_TEXT_LORA_SUFFIXES = [
@@ -33,6 +36,36 @@ DEFAULT_TEXT_LORA_SUFFIXES = [
     "up_proj",
     "down_proj",
 ]
+
+
+def sanitize_trainer_state_json_for_resume(checkpoint_dir: str) -> None:
+    """
+    Newer transformers may save extra keys in trainer_state.json; older TrainerState
+    rejects unknown kwargs. Drop keys not in the current TrainerState dataclass.
+    """
+    path = os.path.join(checkpoint_dir, "trainer_state.json")
+    if not os.path.isfile(path):
+        return
+    allowed = {f.name for f in dataclasses.fields(TrainerState)}
+    with open(path, "r+", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            data = json.loads(f.read())
+            extra = [k for k in list(data.keys()) if k not in allowed]
+            if not extra:
+                return
+            for k in extra:
+                del data[k]
+            out = json.dumps(data, indent=2)
+            f.seek(0)
+            f.truncate()
+            f.write(out)
+            f.flush()
+            os.fsync(f.fileno())
+            print(f"[SFT] removed unsupported TrainerState keys from {path}: {extra}")
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def parse_bool(value: str) -> bool:
@@ -52,6 +85,12 @@ def parse_args() -> argparse.Namespace:
         type=parse_bool,
         default=None,
         help="Override config and enable/disable image/frame inputs.",
+    )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        type=str,
+        default=None,
+        help="Path to a Trainer checkpoint dir (e.g. ./outputs/.../checkpoint-800) to resume training.",
     )
     return parser.parse_args()
 
@@ -91,6 +130,7 @@ class TrainConfig:
     format_mix_strategy: str = "expand"
     append_format_instruction: bool = True
     drop_code_cot: bool = True
+    resume_from_checkpoint: Optional[str] = None
 
 
 SUPPORTED_REASONING_FORMATS = {"answer", "cot", "long_cot"}
@@ -700,7 +740,15 @@ def train(config: TrainConfig) -> None:
         data_collator=collator,
     )
 
-    trainer.train()
+    resume_ckpt = config.resume_from_checkpoint
+    if resume_ckpt:
+        resume_ckpt = os.path.abspath(os.path.expanduser(resume_ckpt))
+        if not os.path.isdir(resume_ckpt):
+            raise FileNotFoundError(f"resume_from_checkpoint is not a directory: {resume_ckpt}")
+        sanitize_trainer_state_json_for_resume(resume_ckpt)
+        print(f"[SFT] resuming from checkpoint: {resume_ckpt}")
+
+    trainer.train(resume_from_checkpoint=resume_ckpt if resume_ckpt else None)
     trainer.save_state()
     trainer.model.save_pretrained(config.output_dir)
     save_processor_or_tokenizer(processor, tokenizer, config.output_dir)
@@ -711,4 +759,6 @@ if __name__ == "__main__":
     cfg = load_config(cli_args.config)
     if cli_args.use_vision is not None:
         cfg.use_vision = cli_args.use_vision
+    if cli_args.resume_from_checkpoint is not None:
+        cfg.resume_from_checkpoint = cli_args.resume_from_checkpoint
     train(cfg)

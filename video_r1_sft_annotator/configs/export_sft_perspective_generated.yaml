@@ -1,6 +1,0 @@
-generated_granularity_path: outputs/generate_granularity/generated.jsonl
-output_path: outputs/sft/video_r1_cot_perspective_sft.json
-summary_path: outputs/sft/perspective_summary.json
-frames_source_path: data/video_r1_cot/processed/train.jsonl
-frames_per_sample: 8
-max_samples: null

@@ -26,7 +26,7 @@ SFT는 현재 두 갈래로 운영된다.
 
 ```text
 GRPO_Video/
-├── setup.sh                    # 레포 공통 환경 설치
+├── setup.sh                    # GRPO(r1-v) 환경 설치 — SFT는 scripts/run_setup_sft.sh + sft/requirements.txt
 ├── merge_readme.md             # SFT LoRA merge 가이드
 ├── analyze_train_log.ipynb     # 학습 로그 분석 노트북
 ├── parsed_train_metrics.csv    # 파싱된 학습 메트릭
@@ -78,7 +78,7 @@ GRPO_Video/
 │   ├── r1-v/                   # GRPO 학습 코드 (open_r1 기반)
 │   │   ├── configs/
 │   │   ├── src/open_r1/
-│   │   │   ├── grpo_uvb.py
+│   │   │   ├── grpo.py
 │   │   │   ├── grpo_video.py
 │   │   │   └── trainer/
 │   │   └── outputs/
@@ -90,10 +90,9 @@ GRPO_Video/
 │       ├── prepare_mmvu_grpo_data.sh
 │       ├── prepare_all_grpo_data.sh
 │       ├── prepare_uvb_full_split_local_videos.sh
-│       ├── run_grpo_uvb_answer_only.sh
-│       ├── run_grpo_uvb_answer_only_lora.sh
+│       ├── run_grpo_answer_only_lora.sh
 │       ├── check_environment.sh
-│       └── RUN_GRPO_UVB.md
+│       └── RUN_GRPO.md
 │
 ├── docs/
 └── analysis_plots/
@@ -149,7 +148,7 @@ MMVU 원본
 | SFT dataset 생성 | Video-R1에서 length/perspective SFT JSON 생성 | `video_r1_sft_annotator` 하위 스크립트 | `processed/train.jsonl`, 프레임 | `outputs/sft/*.json` |
 | SFT | Qwen2.5-VL-3B에 LoRA SFT | `sft/scripts/run_train.sh` | length 또는 perspective JSON | `sft/outputs/...` |
 | Merge | LoRA 병합 | `sft/scripts/run_merge.sh` | merged 설정 파일 | merged 모델 디렉터리 |
-| GRPO | Video-R1 train / UVB test로 학습 및 테스트 추론 | `run_grpo_uvb_answer_only.sh` → `open_r1.grpo_video` | `video_r1_grpo_train.jsonl`, `uvb_grpo_test.jsonl`, merged 모델 | `src/r1-v/outputs/...` |
+| GRPO | Video-R1 train / UVB test로 학습 및 테스트 추론 | `run_grpo_answer_only_lora.sh` → `open_r1.grpo_video` | `video_r1_grpo_train.jsonl`, `uvb_grpo_test.jsonl`, merged 모델 | `src/r1-v/outputs/...` |
 | Eval | 저장된 모델로 UVB 테스트만 별도 평가 | `uvb_eval_only.py` | `--model`, `--test-file` | 터미널 메트릭, 선택 시 예측/JSON 파일 |
 
 ---
@@ -489,11 +488,11 @@ HF MMVU validation metadata
 - JSON/JSONL 기록
 
 
-### 7.4 `grpo_uvb.py` / `grpo_video.py`
+### 7.4 `grpo.py` / `grpo_video.py`
 
 현재 실제 의미는 UVB 전용이라기보다, 공통 비디오 GRPO 진입점에 가깝다.
 
-- `grpo_uvb.py`
+- `grpo.py`
   - 기존 이름을 유지한 메인 구현
   - Train/Test JSONL을 읽고 GRPO 트레이너를 호출
 
@@ -554,7 +553,7 @@ bash src/scripts/prepare_uvb_grpo_data.sh
 기본 실행 스크립트:
 
 ```bash
-bash src/scripts/run_grpo_uvb_answer_only.sh
+bash src/scripts/run_grpo_answer_only_lora.sh
 ```
 
 현재 기본값:

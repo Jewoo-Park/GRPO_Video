@@ -1,9 +1,7 @@
 import argparse
 import json
-import os
 import re
 import time
-import uuid
 from collections import Counter
 from pathlib import Path
 
@@ -20,56 +18,32 @@ def resize_image_to_pixel_bounds(
     width, height = image.size
     if width <= 0 or height <= 0:
         return image
-
     pixels = width * height
     target_pixels = pixels
     if max_pixels is not None and pixels > max_pixels:
         target_pixels = max_pixels
     elif min_pixels is not None and pixels < min_pixels:
         target_pixels = min_pixels
-
     if target_pixels == pixels:
         return image
-
     scale = (target_pixels / float(pixels)) ** 0.5
     new_w = max(1, int(width * scale))
     new_h = max(1, int(height * scale))
     return image.resize((new_w, new_h), Image.Resampling.BICUBIC)
 
 
-def _agent_debug_log(hypothesis_id: str, location: str, message: str, data: dict, run_id: str = "pre-fix") -> None:
-    payload = {
-        "sessionId": "0a9c50",
-        "id": f"log_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}",
-        "timestamp": int(time.time() * 1000),
-        "location": location,
-        "message": message,
-        "data": data,
-        "runId": run_id,
-        "hypothesisId": hypothesis_id,
-    }
-    try:
-        with open(
-            "/Users/jw246/Desktop/NTU COSMO LAB/cloned Repos/GRPO_Video/.cursor/debug-0a9c50.log",
-            "a",
-            encoding="utf-8",
-        ) as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-
-
 def extract_answer(text: str) -> str:
-    # Accept both <ANSWER>...</ANSWER> and occasional case/tag variants.
     m = re.search(r"<ANSWER[S]?>(.*?)</ANSWER[S]?>", text, re.DOTALL | re.IGNORECASE)
     return (m.group(1) if m else text).strip()
 
+
 def extract_choice_letter(text: str) -> str:
+    # MMVU uses options A-E
     s = extract_answer(text)
-    m = re.search(r"\b([A-G])\b", s, re.IGNORECASE)
+    m = re.search(r"\b([A-E])\b", s, re.IGNORECASE)
     if m:
         return m.group(1).lower()
-    m = re.search(r"([A-G])", s, re.IGNORECASE)
+    m = re.search(r"([A-E])", s, re.IGNORECASE)
     if m:
         return m.group(1).lower()
     return norm(s)
@@ -100,11 +74,7 @@ def extract_reasoning_text(text: str) -> str:
 def text_stats(text: str, tokenizer) -> dict:
     words = re.findall(r"\S+", text)
     token_ids = tokenizer.encode(text, add_special_tokens=False)
-    return {
-        "chars": len(text),
-        "words": len(words),
-        "tokens": len(token_ids),
-    }
+    return {"chars": len(text), "words": len(words), "tokens": len(token_ids)}
 
 
 _FORMAT_PATTERNS = (
@@ -129,7 +99,7 @@ def load_rows(path: Path, max_samples: int | None) -> list[dict]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate UVB GRPO checkpoint with vLLM inference.")
+    parser = argparse.ArgumentParser(description="Evaluate MMVU GRPO checkpoint with vLLM inference.")
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--test-file", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda:1")
@@ -148,31 +118,16 @@ def main() -> None:
 
     # Auto-generate default output paths if not specified
     _model_dir = Path(args.model)
-    _ts = run_id
     if not args.save_preds:
-        args.save_preds = str(_model_dir / f"eval_predictions_{_ts}.jsonl")
+        args.save_preds = str(_model_dir / f"mmvu_predictions_{run_id}.jsonl")
     if not args.save_json:
-        args.save_json = str(_model_dir / f"eval_metrics_{_ts}.json")
+        args.save_json = str(_model_dir / f"mmvu_metrics_{run_id}.json")
 
     test_path = Path(args.test_file)
     rows = load_rows(test_path, args.max_samples)
-    if len(rows) == 0:
+    if not rows:
         raise SystemExit(f"No rows found in {test_path}")
     base_dir = test_path.resolve().parent
-    # region agent log
-    _agent_debug_log(
-        hypothesis_id="H4",
-        location="src/eval/uvb_eval_only.py:main:args",
-        message="Eval config and dataset loaded",
-        data={
-            "frames_per_sample": args.frames_per_sample,
-            "max_completion_length": args.max_completion_length,
-            "temperature": args.temperature,
-            "total_rows": len(rows),
-        },
-        run_id=run_id,
-    )
-    # endregion
 
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=False)
     llm = LLM(
@@ -191,23 +146,19 @@ def main() -> None:
     format_ok_count = 0
     total = 0
     preds = []
-    should_collect_rows = True
-    completion_chars = 0
-    completion_words = 0
-    completion_tokens = 0
-    reasoning_chars = 0
-    reasoning_words = 0
-    reasoning_tokens = 0
-    reasoning_types = Counter()
+    completion_chars = completion_words = completion_tokens = 0
+    reasoning_chars = reasoning_words = reasoning_tokens = 0
+    reasoning_types: Counter = Counter()
     has_reasoning = 0
-    pred_letter_counts = Counter()
-    gt_letter_counts = Counter()
-    format_class_counts = Counter()
-    strict_tag_letter_re = re.compile(r"^\s*<ANSWER[S]?>\s*[A-G]\s*</ANSWER[S]?>\s*$", re.IGNORECASE | re.DOTALL)
+    pred_letter_counts: Counter = Counter()
+    gt_letter_counts: Counter = Counter()
+    format_class_counts: Counter = Counter()
+    strict_tag_letter_re = re.compile(r"^\s*<ANSWER[S]?>\s*[A-E]\s*</ANSWER[S]?>\s*$", re.IGNORECASE | re.DOTALL)
     broken_tag_re = re.compile(r"<ANSWER[S]?>|</ANSWER[S]?>", re.IGNORECASE)
 
-    for idx, row in enumerate(rows):
+    for row in rows:
         problem = row["problem"]
+
         resolved_frame_paths = []
         for p in row["frames"][: args.frames_per_sample]:
             frame_path = Path(p)
@@ -215,6 +166,7 @@ def main() -> None:
                 resolved_frame_paths.append(frame_path)
             else:
                 resolved_frame_paths.append((base_dir / frame_path).resolve())
+
         frames = [
             resize_image_to_pixel_bounds(
                 Image.open(p).convert("RGB"),
@@ -223,20 +175,7 @@ def main() -> None:
             )
             for p in resolved_frame_paths
         ]
-        if idx < 5:
-            # region agent log
-            _agent_debug_log(
-                hypothesis_id="H4",
-                location="src/eval/uvb_eval_only.py:main:frame_sampling",
-                message="Resolved frame count for sample",
-                data={
-                    "sample_idx": idx,
-                    "question_id": row.get("question_id"),
-                    "resolved_frames": len(resolved_frame_paths),
-                },
-                run_id=run_id,
-            )
-            # endregion
+
         messages = [
             {
                 "role": "system",
@@ -252,11 +191,9 @@ def main() -> None:
                     "Your response must end with <ANSWER>...</ANSWER>.\n\n"
                     "**Examples:**\n\n"
                     "User: [Video frames] What color is the car in the video?\n"
-                    "Assistant: <ANSWER>red</ANSWER>\n"
-                    "[Direct observation - no reasoning needed]\n\n"
+                    "Assistant: <ANSWER>red</ANSWER>\n\n"
                     "User: [Video frames] Why did the person in the video turn left after stopping at the sign?\n"
-                    "Assistant: <COT>The person stopped at the stop sign, looked both ways, then turned left. This suggests they were following traffic rules and turning at an intersection.</COT><ANSWER>To follow traffic rules and safely turn at the intersection.</ANSWER>\n"
-                    "[Requires reasoning about actions and intent]\n\n"
+                    "Assistant: <COT>The person stopped at the stop sign, looked both ways, then turned left.</COT><ANSWER>To follow traffic rules and safely turn at the intersection.</ANSWER>\n\n"
                     "Now answer the question based on the video. Use simple format for direct questions and reasoning format for complex ones."
                 )}],
             },
@@ -273,18 +210,20 @@ def main() -> None:
         gt = extract_choice_letter(row["solution"])
         ok = int(pred == gt)
         fmt = format_ok(text)
+
         if strict_tag_letter_re.fullmatch(text):
             format_class = "strict_tag_letter"
         elif broken_tag_re.search(text):
             format_class = "broken_or_partial_tag"
         elif fmt:
             format_class = "tagged_non_strict"
-        elif re.match(r"^\s*[A-G]\.", text, re.IGNORECASE):
+        elif re.match(r"^\s*[A-E]\.", text, re.IGNORECASE):
             format_class = "plain_option_sentence"
-        elif re.match(r"^\s*[A-G]\s*$", text, re.IGNORECASE):
+        elif re.match(r"^\s*[A-E]\s*$", text, re.IGNORECASE):
             format_class = "plain_letter"
         else:
             format_class = "other"
+
         reasoning_type = extract_reasoning_type(text)
         reasoning_text = extract_reasoning_text(text)
         full_len = text_stats(text, processor.tokenizer)
@@ -306,50 +245,28 @@ def main() -> None:
         gt_letter_counts[gt] += 1
         format_class_counts[format_class] += 1
 
-        if idx < 80:
-            # region agent log
-            _agent_debug_log(
-                hypothesis_id="H1_H2_H3",
-                location="src/eval/uvb_eval_only.py:main:sample_eval",
-                message="Per-sample eval snapshot",
-                data={
-                    "sample_idx": idx,
-                    "question_id": row.get("question_id"),
-                    "pred": pred,
-                    "gt": gt,
-                    "correct": ok,
-                    "format_ok": fmt,
-                    "format_class": format_class,
-                    "completion_tokens": full_len["tokens"],
-                },
-                run_id=run_id,
-            )
-            # endregion
-
-        if should_collect_rows:
-            preds.append(
-                {
-                    "video_id": row.get("video_id"),
-                    "question_id": row.get("question_id"),
-                    "question_category": row.get("question_category"),
-                    "problem": row.get("problem"),
-                    "pred_raw": text,
-                    "detected_reasoning_type": reasoning_type,
-                    "reasoning_text": reasoning_text,
-                    "pred_answer": pred,
-                    "gt_answer": gt,
-                    "correct": ok,
-                    "format_ok": fmt,
-                    "completion_chars": full_len["chars"],
-                    "completion_words": full_len["words"],
-                    "completion_tokens": full_len["tokens"],
-                    "reasoning_chars": reason_len["chars"],
-                    "reasoning_words": reason_len["words"],
-                    "reasoning_tokens": reason_len["tokens"],
-                }
-            )
+        preds.append({
+            "video_id": row.get("video_id"),
+            "question_id": row.get("question_id"),
+            "question_category": row.get("question_category"),
+            "problem": problem,
+            "pred_raw": text,
+            "detected_reasoning_type": reasoning_type,
+            "reasoning_text": reasoning_text,
+            "pred_answer": pred,
+            "gt_answer": gt,
+            "correct": ok,
+            "format_ok": fmt,
+            "completion_chars": full_len["chars"],
+            "completion_words": full_len["words"],
+            "completion_tokens": full_len["tokens"],
+            "reasoning_chars": reason_len["chars"],
+            "reasoning_words": reason_len["words"],
+            "reasoning_tokens": reason_len["tokens"],
+        })
 
     metrics = {
+        "dataset": "MMVU",
         "n": total,
         "answer_accuracy": (correct / total) if total else 0.0,
         "answer_format_rate": (format_ok_count / total) if total else 0.0,
@@ -361,38 +278,24 @@ def main() -> None:
         "avg_reasoning_words": (reasoning_words / total) if total else 0.0,
         "avg_reasoning_tokens": (reasoning_tokens / total) if total else 0.0,
         "reasoning_type_counts": dict(reasoning_types),
+        "format_class_counts": dict(format_class_counts),
+        "pred_letter_counts": dict(pred_letter_counts),
+        "gt_letter_counts": dict(gt_letter_counts),
     }
-    # region agent log
-    _agent_debug_log(
-        hypothesis_id="H1_H2_H3_H4",
-        location="src/eval/uvb_eval_only.py:main:summary",
-        message="Eval summary counters",
-        data={
-            "metrics": metrics,
-            "pred_letter_counts": dict(pred_letter_counts),
-            "gt_letter_counts": dict(gt_letter_counts),
-            "format_class_counts": dict(format_class_counts),
-        },
-        run_id=run_id,
-    )
-    # endregion
-    print(metrics)
+    print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
-    if args.save_preds:
-        out_path = Path(args.save_preds)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w", encoding="utf-8") as f:
-            for row in preds:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        print(f"saved predictions: {out_path}")
+    out_preds = Path(args.save_preds)
+    out_preds.parent.mkdir(parents=True, exist_ok=True)
+    with out_preds.open("w", encoding="utf-8") as f:
+        for row in preds:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"saved predictions: {out_preds}")
 
-    if args.save_json:
-        out_path = Path(args.save_json)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"metrics": metrics, "results": preds}
-        with out_path.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        print(f"saved report json: {out_path}")
+    out_json = Path(args.save_json)
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    with out_json.open("w", encoding="utf-8") as f:
+        json.dump({"metrics": metrics, "results": preds}, f, ensure_ascii=False, indent=2)
+    print(f"saved report json: {out_json}")
 
 
 if __name__ == "__main__":

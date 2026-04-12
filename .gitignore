@@ -19,6 +19,17 @@ sft/outputs/
 # Local environments
 .venv/
 venv/
+.venv_realign/
+.venv_sft/
 
-# Keep data out of Git in this repo
-data/
+# Ignore only repo-root `data` (symlink to scratch or local copies). Do not use `data/` — it hides `sft/data/`.
+/data
+
+.cursor/
+*.egg-info/
+sft/*.log
+
+# Large SFT data under sft/data (frames, jsonl); keep only shell helpers versioned
+sft/data/*
+!sft/data/prepare_/
+!sft/data/prepare_/**

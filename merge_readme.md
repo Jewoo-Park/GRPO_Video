@@ -15,9 +15,9 @@
 
 | 항목 | 경로 |
 |------|------|
-| SFT LoRA 어댑터 | `sft/outputs/qwen25vl3b_lora_sft_length/` 또는 `sft/outputs/qwen25vl3b_lora_sft_perspective/` |
-| 백본 모델 | `Qwen/Qwen2.5-VL-3B-Instruct` (HuggingFace에서 자동 다운로드) |
-| merge 결과 | `sft/outputs/qwen25vl3b_lora_merged_length/` 또는 `sft/outputs/qwen25vl3b_lora_merged_perspective/` |
+| SFT LoRA 어댑터 | `sft/outputs/qwen25vl7b_lora_sft_length/` 또는 `sft/outputs/qwen25vl7b_lora_sft_perspective/` |
+| 백본 모델 | `Qwen/Qwen2.5-VL-7B-Instruct` (HuggingFace에서 자동 다운로드) |
+| merge 결과 | `sft/outputs/qwen25vl7b_lora_merged_length/` 또는 `sft/outputs/qwen25vl7b_lora_merged_perspective/` |
 
 ---
 
@@ -82,20 +82,20 @@ pip install flash-attn --no-build-isolation --no-binary :all:
 
 ## 4단계: merge 설정 파일 확인
 
-예를 들어 length SFT adapter를 merge하려면 `sft/configs/merge_lora_qwen25vl3b_length.yaml` 또는 그에 준하는 설정에서 아래 세 값을 맞춘다.
+예를 들어 length SFT adapter를 merge하려면 `sft/configs/merge_lora_qwen25vl7b_length.yaml` 또는 그에 준하는 설정에서 아래 세 값을 맞춘다.
 
 ```yaml
-model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
-adapter_name_or_path: ./outputs/qwen25vl3b_lora_sft_length
-export_dir: ./outputs/qwen25vl3b_lora_merged_length
+model_name_or_path: Qwen/Qwen2.5-VL-7B-Instruct
+adapter_name_or_path: ./outputs/qwen25vl7b_lora_sft_length
+export_dir: ./outputs/qwen25vl7b_lora_merged_length
 remap_adapter_keys: true
 ```
 
 perspective SFT를 merge할 때는 대응 경로만 바꾸면 된다.
 
 ```yaml
-adapter_name_or_path: ./outputs/qwen25vl3b_lora_sft_perspective
-export_dir: ./outputs/qwen25vl3b_lora_merged_perspective
+adapter_name_or_path: ./outputs/qwen25vl7b_lora_sft_perspective
+export_dir: ./outputs/qwen25vl7b_lora_merged_perspective
 ```
 
 > **`remap_adapter_keys: true` 필수.**
@@ -114,7 +114,7 @@ SFT_MODE=length bash scripts/run_merge.sh
 
 정상 진행 시 출력:
 ```
-[SFT-MERGE] config: configs/merge_lora_qwen25vl3b_length.yaml
+[SFT-MERGE] config: configs/merge_lora_qwen25vl7b_length.yaml
 Loading checkpoint shards: 100%|███████| 2/2 [...]
 # (경고/로그 없이) 프롬프트 복귀
 ```
@@ -127,7 +127,7 @@ Loading checkpoint shards: 100%|███████| 2/2 [...]
 ## 6단계: merge 결과 검증
 
 ```bash
-ls -lh /workspace/GRPO_Video/sft/outputs/qwen25vl3b_lora_merged_length/
+ls -lh /workspace/GRPO_Video/sft/outputs/qwen25vl7b_lora_merged_length/
 ```
 
 정상 결과:
@@ -147,25 +147,24 @@ ls -lh /workspace/GRPO_Video/sft/outputs/qwen25vl3b_lora_merged_length/
 
 ## 다음 단계: GRPO 학습
 
-merge 완료 후 GRPO 학습으로 이어집니다. 상세 내용은 `src/scripts/RUN_GRPO_UVB.md` 참조.
+merge 완료 후 GRPO 학습으로 이어집니다. 상세 내용은 `src/scripts/RUN_GRPO.md` 참조.
 
 ```bash
 # flash-attn 재설치 (GRPO 훈련에 필요)
 pip install flash-attn --no-build-isolation --no-binary :all:
 
-# GRPO 실행
-cd /workspace/GRPO_Video/src/scripts
-export QWEN_PATH="/workspace/GRPO_Video/sft/outputs/qwen25vl3b_lora_merged_length"
+# GRPO 실행 (레포 루트에서)
+cd /home/users/ntu/n2500182/workspace_JWP/repos/GRPO_Video_2
+source /home/users/ntu/n2500182/scratch/.venv_realign/bin/activate
+export QWEN_PATH="/scratch/users/ntu/n2500182/models/qwen25vl7b_lora_merged_length"
+export QWEN_BASE_PATH="/scratch/users/ntu/n2500182/models/Qwen2.5-VL-7B-Instruct"
 export NUM_GPUS=3
 export TRAIN_NUM_GPUS=2
 export CUDA_VISIBLE_DEVICES=0,1,2
-./run_grpo_uvb_answer_only.sh
+bash src/scripts/run_grpo_answer_only_lora.sh
 ```
 
-현재는 `QWEN_PATH`에 아래 둘 중 하나를 넣는다고 이해하면 된다.
-
-- `sft/outputs/qwen25vl3b_lora_merged_length`
-- `sft/outputs/qwen25vl3b_lora_merged_perspective`
+`QWEN_PATH`는 병합 산출물 디렉터리. 이 계정에서는 위 scratch 경로 또는 `sft/outputs/qwen25vl7b_lora_merged_length` / `..._perspective` (레포 상대).
 
 ---
 

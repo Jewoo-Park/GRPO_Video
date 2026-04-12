@@ -3,7 +3,7 @@ import json
 import os
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Dict, Iterable, List, Tuple
 
 
 FRAME_GLOB_PATTERNS = ("frame_*.jpg", "frame_*.jpeg", "frame_*.png", "*.jpg", "*.jpeg", "*.png")
@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_rows(path: Path) -> list[dict[str, Any]]:
+def load_rows(path: Path) -> List[Dict[str, Any]]:
     with path.open("r", encoding="utf-8") as f:
         if path.suffix.lower() == ".jsonl":
             return [json.loads(line) for line in f if line.strip()]
@@ -38,7 +38,7 @@ def load_rows(path: Path) -> list[dict[str, Any]]:
     return data
 
 
-def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
@@ -65,7 +65,7 @@ def normalize_answer_text(text: str) -> str:
     return raw
 
 
-def build_question_with_options(question: str, options: list[str]) -> str:
+def build_question_with_options(question: str, options: List[str]) -> str:
     question_text = str(question or "").strip()
     option_block = "\n".join(str(opt).strip() for opt in options if str(opt).strip())
     if not option_block:
@@ -73,22 +73,34 @@ def build_question_with_options(question: str, options: list[str]) -> str:
     return f"{question_text}\n\nOptions:\n{option_block}"
 
 
-def collect_frame_paths_from_subdir(frame_subdir: str, frames_root: Path, frames_per_sample: int) -> list[Path]:
+def collect_frame_paths_from_subdir(frame_subdir: str, frames_root: Path, frames_per_sample: int) -> List[Path]:
     normalized_subdir = str(frame_subdir or "").strip()
     if not normalized_subdir:
         return []
+
+    def gather_from_dir(frame_dir: Path) -> List[Path]:
+        if not frame_dir.exists():
+            return []
+        frames: List[Path] = []
+        for pattern in FRAME_GLOB_PATTERNS:
+            frames.extend(frame_dir.glob(pattern))
+        return sorted({path.resolve() for path in frames if path.is_file()})[:frames_per_sample]
+
+    # Layout A: frames_root/<frame_subdir> (e.g. sft/data/frames/OCR/OCR__... — symlinks into .../train/...)
+    direct = gather_from_dir(frames_root / normalized_subdir)
+    if direct:
+        return direct
+
+    # Layout B: frames_root/{train,test}/<frame_subdir>
     for split_name in ("train", "test"):
-        frame_dir = frames_root / split_name / normalized_subdir
-        if frame_dir.exists():
-            frames: list[Path] = []
-            for pattern in FRAME_GLOB_PATTERNS:
-                frames.extend(frame_dir.glob(pattern))
-            return sorted({path.resolve() for path in frames if path.is_file()})[:frames_per_sample]
+        nested = gather_from_dir(frames_root / split_name / normalized_subdir)
+        if nested:
+            return nested
     return []
 
 
-def relativize_paths(paths: list[Path], output_dir: Path) -> list[str]:
-    serialized: list[str] = []
+def relativize_paths(paths: List[Path], output_dir: Path) -> List[str]:
+    serialized: List[str] = []
     for path in paths:
         try:
             serialized.append(os.path.relpath(path, output_dir))
@@ -98,15 +110,15 @@ def relativize_paths(paths: list[Path], output_dir: Path) -> list[str]:
 
 
 def resolve_media(
-    row: dict[str, Any],
+    row: Dict[str, Any],
     input_path: Path,
     output_dir: Path,
     frames_root: Path,
     frames_per_sample: int,
-) -> dict[str, Any]:
+) -> Dict[str, Any]:
     explicit_frames = row.get("frames")
     if isinstance(explicit_frames, list):
-        resolved_frames: list[Path] = []
+        resolved_frames: List[Path] = []
         for item in explicit_frames:
             text = str(item or "").strip()
             if not text:
@@ -139,14 +151,14 @@ def resolve_media(
 
 
 def export_length_rows(
-    rows: list[dict[str, Any]],
+    rows: List[Dict[str, Any]],
     input_path: Path,
     output_path: Path,
     frames_root: Path,
     frames_per_sample: int,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    exported: list[dict[str, Any]] = []
-    stats: Counter[str] = Counter()
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    exported: List[Dict[str, Any]] = []
+    stats = Counter()
 
     for row in rows:
         question = str(row.get("question") or "")
@@ -215,14 +227,14 @@ def export_length_rows(
 
 
 def export_perspective_rows(
-    rows: list[dict[str, Any]],
+    rows: List[Dict[str, Any]],
     input_path: Path,
     output_path: Path,
     frames_root: Path,
     frames_per_sample: int,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    exported: list[dict[str, Any]] = []
-    stats: Counter[str] = Counter()
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    exported: List[Dict[str, Any]] = []
+    stats = Counter()
 
     for row in rows:
         question = str(row.get("question") or "")

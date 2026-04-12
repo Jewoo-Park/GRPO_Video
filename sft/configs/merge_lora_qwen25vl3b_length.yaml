@@ -1,4 +1,6 @@
-model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
-adapter_name_or_path: ./outputs/qwen25vl3b_lora_sft_length
-export_dir: ./outputs/qwen25vl3b_lora_merged_length
+# Local snapshot (HPC compute nodes often have no HF hub access). Override with --model-name-or-path if needed.
+model_name_or_path: /scratch/users/ntu/n2500182/models/Qwen2.5-VL-7B-Instruct
+adapter_name_or_path: ./outputs/qwen25vl7b_lora_sft_length
+# Full ~15GB+ merged weights: use scratch to avoid home/workspace quota (Disk quota exceeded).
+export_dir: /scratch/users/ntu/n2500182/models/qwen25vl7b_lora_merged_length
 remap_adapter_keys: true

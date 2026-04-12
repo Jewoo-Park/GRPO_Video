@@ -1,4 +1,4 @@
-from open_r1.grpo_uvb import GRPOVideoScriptArguments, main
+from open_r1.grpo import GRPOVideoScriptArguments, main
 from trl import GRPOConfig, ModelConfig, TrlParser
 
 

@@ -2,18 +2,25 @@
 import argparse
 import os
 import shutil
+import sys
 import tempfile
 
 import torch
 import yaml
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+from transformers import AutoProcessor, AutoTokenizer
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+from qwen25vl_safetensors_keys import fix_qwen25vl_visual_prefix_in_dir
 
 
 def remap_adapter_keys_and_prepare_dir(adapter_name_or_path: str) -> str:
     """
-    Remap known adapter key mismatches (e.g. language_model.layers, visual.blocks)
-    so PeftModel.from_pretrained can load without 'missing adapter keys' warnings.
+    Remap known adapter key mismatches (e.g. language_model.layers, visual.blocks,
+    visual.merger, and default-adapter naming) so PeftModel.from_pretrained can
+    load without 'missing adapter keys' warnings.
     Writes remapped adapter to a temp dir and returns that path.
     """
     try:
@@ -29,6 +36,12 @@ def remap_adapter_keys_and_prepare_dir(adapter_name_or_path: str) -> str:
     for k, v in sd.items():
         nk = k.replace(".model.model.language_model.layers.", ".model.model.layers.")
         nk = nk.replace(".model.model.visual.blocks.", ".model.visual.blocks.")
+        # Same extra `.model.` wrapper as blocks; PEFT expects base_model.model.visual.merger.*
+        nk = nk.replace(".model.model.visual.merger.", ".model.visual.merger.")
+        # Training saves lora_A.weight; Peft default adapter uses lora_A.default.weight
+        if ".visual.merger." in nk:
+            nk = nk.replace("lora_A.weight", "lora_A.default.weight")
+            nk = nk.replace("lora_B.weight", "lora_B.default.weight")
         new_sd[nk] = v
     tmpdir = tempfile.mkdtemp(prefix="merge_lora_remap_")
     try:
@@ -75,25 +88,61 @@ def save_processor_or_tokenizer(model_name_or_path: str, export_dir: str) -> Non
     tokenizer.save_pretrained(export_dir)
 
 
+def ensure_cuda_home() -> None:
+    """Best-effort CUDA_HOME for tools that import DeepSpeed (merge save path avoids DS when possible)."""
+    ch = os.environ.get("CUDA_HOME", "").strip()
+    if ch and os.path.isdir(ch):
+        return
+    try:
+        import torch.utils.cpp_extension as cep
+
+        th = getattr(cep, "CUDA_HOME", None)
+        if th and isinstance(th, str) and os.path.isdir(th):
+            os.environ["CUDA_HOME"] = th
+            return
+    except Exception:
+        pass
+    for candidate in ("/usr/local/cuda", "/usr/local/cuda-12", "/usr/local/cuda-12.4"):
+        if os.path.isdir(candidate):
+            os.environ["CUDA_HOME"] = candidate
+            return
+
+
+def save_merged_pretrained(model, export_dir: str) -> None:
+    """merge_and_unload() returns an unwrapped model; skip accelerate unwrap to avoid importing deepspeed."""
+    import transformers.modeling_utils as modeling_utils
+
+    _unwrap = modeling_utils.unwrap_model
+
+    def _unwrap_identity(m, *args, **kwargs):
+        return m
+
+    try:
+        modeling_utils.unwrap_model = _unwrap_identity  # type: ignore[assignment]
+        model.save_pretrained(export_dir, safe_serialization=True)
+    finally:
+        modeling_utils.unwrap_model = _unwrap
+
+
 def get_base_model(model_name_or_path: str):
+    """Load Qwen2.5-VL base weights. No CausalLM fallback — VL config is incompatible and hides real errors."""
     try:
         from transformers import Qwen2_5_VLForConditionalGeneration  # type: ignore
-
-        return Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_name_or_path,
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-        )
-    except Exception:
-        return AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-        )
+    except ImportError as e:
+        raise ImportError(
+            "Install a transformers build that provides Qwen2_5_VLForConditionalGeneration "
+            "(Qwen2.5-VL merge is not supported via AutoModelForCausalLM)."
+        ) from e
+    return Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        model_name_or_path,
+        torch_dtype=torch.float16,
+        trust_remote_code=True,
+    )
 
 
 def main() -> None:
     args = parse_args()
+    ensure_cuda_home()
     if args.config is not None:
         cfg = load_yaml(args.config)
     else:
@@ -123,7 +172,13 @@ def main() -> None:
     peft_model = PeftModel.from_pretrained(base_model, adapter_name_or_path)
     merged_model = peft_model.merge_and_unload()
 
-    merged_model.save_pretrained(export_dir, safe_serialization=True)
+    save_merged_pretrained(merged_model, export_dir)
+    n_files, n_tensors = fix_qwen25vl_visual_prefix_in_dir(export_dir)
+    if n_tensors:
+        print(
+            f"[merge_lora] Fixed HF/vLLM keys: model.visual.* -> visual.* "
+            f"({n_tensors} tensors in {n_files} shard file(s))"
+        )
     save_processor_or_tokenizer(model_name_or_path, export_dir)
 
     if adapter_to_remove and os.path.isdir(adapter_to_remove):

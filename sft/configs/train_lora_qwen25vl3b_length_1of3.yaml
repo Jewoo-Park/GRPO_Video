@@ -1,8 +1,8 @@
-model_name_or_path: Qwen/Qwen2.5-VL-7B-Instruct
+model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
 train_files:
-  - ./data/video_r1_length_sft_from_filtered.jsonl
-output_dir: ./outputs/qwen25vl7b_lora_sft_length
-merge_output_dir: ./outputs/qwen25vl7b_lora_merged_length
+  - ./data/video_r1_length_sft_1of3.jsonl
+output_dir: ./outputs/qwen25vl3b_lora_sft_length
+merge_output_dir: ./outputs/qwen25vl3b_lora_merged_length
 
 max_length: 4096
 val_size: 0.05
@@ -15,7 +15,7 @@ learning_rate: 2.0e-4
 weight_decay: 0.0
 warmup_ratio: 0.03
 lr_scheduler_type: cosine
-num_train_epochs: 2.0
+num_train_epochs: 1.0
 
 per_device_train_batch_size: 1
 per_device_eval_batch_size: 1

@@ -12,17 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+import logging
+import math
 import os
 import textwrap
 import importlib
 import inspect
 from collections import defaultdict
 from contextlib import nullcontext, contextmanager
+from types import SimpleNamespace
 from typing import Any, Callable, Optional, Union
 from accelerate.utils.other import is_compiled_module
 from accelerate.utils import broadcast_object_list, gather, gather_object
 import torch
 import torch.utils.data
+from torch.utils.checkpoint import checkpoint
 import transformers
 import warnings
 from unittest.mock import patch
@@ -68,6 +73,9 @@ from trl import GRPOTrainer
 import copy
 from PIL import Image
 
+from open_r1.trainer.grpo_log_utils import format_grpo_train_metrics_line
+from open_r1.trainer.qwen25_config_utils import ensure_qwen25_rope_scaling
+
 if is_peft_available():
     from peft import PeftConfig, PeftModel, get_peft_model
 
@@ -82,6 +90,48 @@ from torch.utils.data import Sampler
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+
+logger = logging.getLogger(__name__)
+
+_GRPO_MM_PIXEL_LOG_FILTER_REGISTERED = False
+
+
+def _register_grpo_vllm_hf_mm_pixel_log_filter() -> None:
+    """
+    Only used when `VLLM_USE_MM_PROCESSOR_KWARGS=true`. vLLM merges `mm_processor_kwargs` into HF
+    `Processor.__call__` while Qwen2.5-VL already set min/max on the image processor in
+    `get_hf_processor(**mm_kwargs)`, so duplicate flat kwargs trigger Transformers' 'will be ignored'
+    warnings (harmless). Filter those (and matching vLLM 'dropped' lines) unless GRPO_VERBOSE_MM_PIXEL_LOGS=1.
+    """
+    global _GRPO_MM_PIXEL_LOG_FILTER_REGISTERED
+    if _GRPO_MM_PIXEL_LOG_FILTER_REGISTERED:
+        return
+    if os.getenv("GRPO_VERBOSE_MM_PIXEL_LOGS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        _GRPO_MM_PIXEL_LOG_FILTER_REGISTERED = True
+        return
+
+    class _MmPixelNoiseFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            msg = record.getMessage()
+            if "min_pixels" not in msg and "max_pixels" not in msg:
+                return True
+            if "not a valid argument for this processor and will be ignored" in msg:
+                return False
+            if (
+                "intended overrides are not keyword" in msg
+                and "will be dropped" in msg
+            ):
+                return False
+            return True
+
+    flt = _MmPixelNoiseFilter()
+    for logger_name in ("transformers.processing_utils", "vllm.utils"):
+        logging.getLogger(logger_name).addFilter(flt)
+    _GRPO_MM_PIXEL_LOG_FILTER_REGISTERED = True
 
 
 def _coerce_qwen25_text_config(cfg: Any) -> Any:
@@ -121,7 +171,54 @@ def _coerce_qwen25_text_config(cfg: Any) -> Any:
         if value is not None:
             setattr(cfg, field_name, value)
 
+    ensure_qwen25_rope_scaling(cfg)
     return cfg
+
+
+def _vllm_grpo_hf_overrides_for_qwen_vl(hf_config: Any) -> Any:
+    """
+    vLLM builds ModelConfig with get_hf_text_config(), which asserts
+    hasattr(config.text_config, "num_attention_heads"). Merged checkpoints often
+    save text_config as a dict, as None, or omit fields — training fixes this via
+    _coerce_qwen25_text_config + from_pretrained(config=...), but vLLM loads the
+    raw JSON from model.name_or_path. Reuse coerce + optional base config copy.
+    """
+    hf_config = _coerce_qwen25_text_config(hf_config)
+    tc = getattr(hf_config, "text_config", None)
+    if tc is not None and hasattr(tc, "num_attention_heads"):
+        return hf_config
+    if os.environ.get("GRPO_VLLM_NO_HF_CONFIG_FIX", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return hf_config
+    base = (
+        os.environ.get("VLLM_REFERENCE_CONFIG_PATH", "").strip()
+        or os.environ.get("QWEN_BASE_PATH", "").strip()
+        or os.environ.get("PROCESSOR_PATH", "").strip()
+    )
+    if not base:
+        return hf_config
+    local_only = os.environ.get(
+        "VLLM_REFERENCE_CONFIG_LOCAL_FILES_ONLY", ""
+    ).strip().lower() in ("1", "true", "yes")
+    try:
+        base_cfg = AutoConfig.from_pretrained(
+            base,
+            trust_remote_code=True,
+            local_files_only=local_only,
+        )
+        base_cfg = _coerce_qwen25_text_config(base_cfg)
+        if getattr(base_cfg, "text_config", None) is not None:
+            hf_config.text_config = base_cfg.text_config
+    except Exception as exc:
+        warnings.warn(
+            "[GRPO vLLM] Could not patch HF config text_config from base path "
+            f"{base!r}: {exc}. Set QWEN_BASE_PATH or copy config.json from the base model.",
+            stacklevel=2,
+        )
+    return hf_config
 
 
 def _patch_vllm_rope_scaling_conflict() -> None:
@@ -197,6 +294,158 @@ def _temporary_cuda_device(device: str):
             torch.cuda.set_device(prev)
         except Exception:
             pass
+
+
+def _normalize_cuda_visible_devices_for_vllm() -> None:
+    """
+    vLLM's CUDA platform does ``int(os.environ['CUDA_VISIBLE_DEVICES'].split(',')[i])``
+    (see vllm/platforms/cuda.py::device_id_to_physical_device_id). Some schedulers set
+    ``CUDA_VISIBLE_DEVICES`` to NVIDIA UUID strings like ``GPU-9416b6ce-...``, which are
+    valid for PyTorch/CUDA but break vLLM (and its model-registry subprocess). Map each
+    entry to NVML device indices when tokens are not plain integers.
+
+    Opt out: ``GRPO_SKIP_CUDA_VISIBLE_DEVICES_FIX=1`` or set numeric
+    ``CUDA_VISIBLE_DEVICES=0,1,2,...`` in the job script.
+    """
+    if os.environ.get("GRPO_SKIP_CUDA_VISIBLE_DEVICES_FIX", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not raw or not str(raw).strip():
+        return
+    parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+    if not parts:
+        return
+
+    def _is_plain_int_token(s: str) -> bool:
+        s = s.strip()
+        if not s:
+            return False
+        if s.isdigit():
+            return True
+        return s[0] == "-" and len(s) > 1 and s[1:].isdigit()
+
+    if all(_is_plain_int_token(p) for p in parts):
+        return
+
+    try:
+        pynvml = importlib.import_module("pynvml")
+    except ImportError:
+        warnings.warn(
+            "[GRPO vLLM] CUDA_VISIBLE_DEVICES is not numeric (e.g. GPU-UUID). "
+            "Install pynvml or set CUDA_VISIBLE_DEVICES=0,1,2,... See "
+            "_normalize_cuda_visible_devices_for_vllm.",
+            stacklevel=2,
+        )
+        return
+
+    indices: list[str] = []
+    try:
+        pynvml.nvmlInit()
+        for p in parts:
+            if _is_plain_int_token(p):
+                indices.append(str(int(p.strip())))
+                continue
+            handle = pynvml.nvmlDeviceGetHandleByUUID(p)
+            indices.append(str(int(pynvml.nvmlDeviceGetIndex(handle))))
+    except Exception as exc:
+        warnings.warn(
+            f"[GRPO vLLM] Could not map CUDA_VISIBLE_DEVICES entries to NVML indices: {exc}. "
+            "Set CUDA_VISIBLE_DEVICES to comma-separated integers (e.g. 0,1,2,3).",
+            stacklevel=2,
+        )
+        return
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+    new_cvd = ",".join(indices)
+    logger.info(
+        "[GRPO vLLM] Normalized CUDA_VISIBLE_DEVICES for vLLM (UUID -> NVML index): %s -> %s",
+        raw,
+        new_cvd,
+    )
+    os.environ["CUDA_VISIBLE_DEVICES"] = new_cvd
+
+
+_VLLM_PROCESSOR_PATH_PATCH_INSTALLED = False
+
+
+def _ensure_vllm_hf_processor_loads_from_processor_path(model_weights_path: str) -> None:
+    """
+    vLLM's ``InputContext.get_hf_processor`` calls ``cached_get_processor(model_config.model)``
+    (the LLM checkpoint dir only). Merged folders often have a broken ``processor_config.json``
+    that triggers ``Qwen2_5_VLProcessor ... multiple values for image_processor``. Training
+    already uses ``PROCESSOR_PATH`` / ``QWEN_BASE_PATH`` for ``AutoProcessor``; redirect vLLM's
+    processor load to the same clean directory.
+
+    No-op if env paths are unset or identical to ``model_weights_path``. Idempotent per process.
+    Opt out: ``GRPO_VLLM_NO_PROCESSOR_PATH_PATCH=1``.
+    """
+    global _VLLM_PROCESSOR_PATH_PATCH_INSTALLED
+    if _VLLM_PROCESSOR_PATH_PATCH_INSTALLED:
+        return
+    if os.environ.get("GRPO_VLLM_NO_PROCESSOR_PATH_PATCH", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return
+    alt = (
+        os.environ.get("PROCESSOR_PATH", "").strip()
+        or os.environ.get("QWEN_BASE_PATH", "").strip()
+    )
+    if not alt:
+        return
+    try:
+        mw = os.path.normpath(os.path.abspath(str(model_weights_path)))
+        ap = os.path.normpath(os.path.abspath(str(alt)))
+    except Exception:
+        return
+    if mw == ap:
+        return
+
+    try:
+        import vllm.transformers_utils.processor as vtp
+        import vllm.inputs.registry as vir
+    except Exception as exc:
+        warnings.warn(
+            f"[GRPO vLLM] Could not import vLLM processor modules for path patch: {exc}",
+            stacklevel=2,
+        )
+        return
+
+    _orig = vtp.get_processor
+
+    def _redirecting_get_processor(processor_name, *args, **kwargs):
+        try:
+            pn = os.path.normpath(os.path.abspath(str(processor_name)))
+        except Exception:
+            pn = str(processor_name)
+        if pn == mw:
+            logger.info(
+                "[GRPO vLLM] Redirecting HF processor load %s -> %s",
+                processor_name,
+                alt,
+            )
+            return _orig(alt, *args, **kwargs)
+        return _orig(processor_name, *args, **kwargs)
+
+    vtp.get_processor = _redirecting_get_processor
+    vtp.cached_get_processor = functools.lru_cache(maxsize=None)(_redirecting_get_processor)
+    vir.cached_get_processor = vtp.cached_get_processor
+    try:
+        import vllm.model_executor.models.whisper as vwh
+
+        vwh.cached_get_processor = vtp.cached_get_processor
+    except Exception:
+        pass
+    _VLLM_PROCESSOR_PATH_PATCH_INSTALLED = True
 
 
 def _peft_state_dict_to_merged_state_dict(
@@ -418,7 +667,29 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 or "Qwen" in model_id
             )
             if is_multimodal_model:
-                processing_class = AutoProcessor.from_pretrained(model_id)
+                # Merged dirs often mix tokenizer + processor saves; AutoProcessor can then raise
+                # TypeError: Qwen2_5_VLProcessor.__init__() got multiple values for argument 'image_processor'.
+                # Point PROCESSOR_PATH at the clean base model dir (same arch) while weights stay on model_id.
+                proc_id = os.environ.get("PROCESSOR_PATH", "").strip() or model_id
+                if proc_id != model_id and (
+                    "/path/to" in proc_id
+                    or "/.../" in proc_id
+                    or "your_actual_subdir" in proc_id
+                ):
+                    logger.warning(
+                        "PROCESSOR_PATH looks like a documentation placeholder (%s); using model weights path for AutoProcessor. "
+                        "Set PROCESSOR_PATH to a real directory (e.g. clean Qwen2.5-VL base) if processor load fails.",
+                        proc_id,
+                    )
+                    proc_id = model_id
+                proc_kw: dict = {"trust_remote_code": True}
+                if os.environ.get("PROCESSOR_LOCAL_FILES_ONLY", "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                ):
+                    proc_kw["local_files_only"] = True
+                processing_class = AutoProcessor.from_pretrained(proc_id, **proc_kw)
                 pad_token_id = processing_class.tokenizer.pad_token_id
                 processing_class.pad_token_id = pad_token_id
                 processing_class.eos_token_id = processing_class.tokenizer.eos_token_id
@@ -545,13 +816,9 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         self.use_vllm = args.use_vllm
         self.vllm_max_pixels = max_pixels
         self.vllm_min_pixels = min_pixels
-        # Newer/older vLLM builds may silently drop max_pixels/min_pixels in
-        # mm_processor_kwargs. Keep it opt-in and enforce pixel bounds via
-        # local image resizing before generate().
-        self.vllm_use_mm_processor_kwargs = (
-            os.getenv("VLLM_USE_MM_PROCESSOR_KWARGS", "false").strip().lower()
-            == "true"
-        )
+        # Pixel bounds: enforced in `_resize_image_to_pixel_bounds` before vLLM. Optional: pass the same limits into
+        # vLLM's HF processor via `VLLM_USE_MM_PROCESSOR_KWARGS=true` (may duplicate kwargs on Processor.__call__;
+        # we register a log filter only in that case).
         self._vllm_device: Optional[str] = None
         # Keep vLLM multimodal batches small to avoid xformers vision kernel crashes.
         self.vllm_prompt_batch_size = max(
@@ -560,6 +827,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         self.vllm_max_frames = max(
             1, int(os.getenv("VLLM_MAX_FRAMES", "8"))
         )
+        self._grpo_image_fallback_events = 0
 
         super().__init__(
             model=model,
@@ -619,6 +887,8 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 )
                 profiling_patch = _build_vllm_profiling_patch()
                 self._vllm_device = vllm_device
+                # vLLM (and its registry subprocess) require int-parseable CUDA_VISIBLE_DEVICES entries.
+                _normalize_cuda_visible_devices_for_vllm()
                 with world_size_patch, profiling_patch, _temporary_cuda_device(vllm_device):
                     _patch_vllm_rope_scaling_conflict()
                     print("vllm is running on: ", vllm_device)
@@ -626,17 +896,45 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                     # Match vLLM image-item limit to the actual per-prompt frame cap (default 8 frames).
                     vllm_max_frames = getattr(args, "vllm_max_frames", None) or self.vllm_max_frames
                     max_mm_images = max(1, int(vllm_max_frames))
+                    # vLLM reserves worst-case multimodal token slots. Without a video limit it still budgets a large
+                    # "video" placeholder; set VLLM_MM_VIDEO_LIMIT>0 only if you pass real video inputs through vLLM.
+                    mm_video_limit = int(os.getenv("VLLM_MM_VIDEO_LIMIT", "0"))
+                    # vLLM memory profiling often underestimates Qwen-VL weight footprint and plans far too many
+                    # KV blocks (~40k+), then OOMs when allocating cache after weights load. Cap blocks and seqs.
+                    _mml = int(args.max_prompt_length) + int(args.max_completion_length)
+                    _blk = int(os.getenv("VLLM_CACHE_BLOCK_SIZE", "16"))
+                    _min_blocks = max(1, (_mml + _blk - 1) // _blk)
+                    _max_seq = max(
+                        4,
+                        int(args.num_generations)
+                        * max(1, int(self.vllm_prompt_batch_size)),
+                    )
+                    _max_seq = min(_max_seq, int(os.getenv("VLLM_MAX_NUM_SEQS_CAP", "32")))
+                    _suggested_blocks = _min_blocks * _max_seq + int(
+                        os.getenv("VLLM_KV_BLOCK_HEADROOM", "128")
+                    )
+                    _blocks_cap = int(os.getenv("VLLM_NUM_GPU_BLOCKS_CAP", "3072"))
+                    _override_blocks = os.getenv("VLLM_NUM_GPU_BLOCKS_OVERRIDE")
+                    if _override_blocks is not None:
+                        num_gpu_blocks_override = int(_override_blocks)
+                    else:
+                        num_gpu_blocks_override = min(
+                            max(_suggested_blocks, _min_blocks + 32), _blocks_cap
+                        )
                     llm_kwargs = {
                         "model": model.name_or_path,
                         "gpu_memory_utilization": self.args.vllm_gpu_memory_utilization,
                         "dtype": torch.bfloat16,
-                        # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
-                        # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
-                        # This is particularly useful here because we generate completions from the same prompts.
-                        "enable_prefix_caching": True,
+                        # Prefix caching uses extra VRAM; off helps a single vLLM GPU fit weights + KV.
+                        "enable_prefix_caching": False,
                         "enforce_eager": True,
-                        "max_model_len": args.max_prompt_length + args.max_completion_length,
-                        "limit_mm_per_prompt": {"image": max_mm_images},
+                        "max_model_len": _mml,
+                        "max_num_seqs": _max_seq,
+                        "num_gpu_blocks_override": num_gpu_blocks_override,
+                        "limit_mm_per_prompt": {
+                            "image": max_mm_images,
+                            "video": mm_video_limit,
+                        },
                     }
                     model_type = getattr(getattr(model, "config", None), "model_type", "")
                     is_qwen_vl = (
@@ -644,11 +942,35 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                         or "Qwen2-VL" in model_id
                         or "Qwen2.5-VL" in model_id
                     )
-                    if self.vllm_use_mm_processor_kwargs and is_qwen_vl:
+                    # Default: do not pass mm_processor_kwargs (avoids HF "ignored min_pixels/max_pixels" noise;
+                    # local resize already matches training). Opt-in for stricter vLLM/token-budget alignment:
+                    # VLLM_USE_MM_PROCESSOR_KWARGS=true (then we hush duplicate-kwarg logs unless
+                    # GRPO_VERBOSE_MM_PIXEL_LOGS=1).
+                    _use_mm_processor_kw = (
+                        os.getenv("VLLM_USE_MM_PROCESSOR_KWARGS", "false").strip().lower()
+                        == "true"
+                    )
+                    if is_qwen_vl and _use_mm_processor_kw:
                         llm_kwargs["mm_processor_kwargs"] = {
                             "max_pixels": max_pixels,
                             "min_pixels": min_pixels,
                         }
+                        _register_grpo_vllm_hf_mm_pixel_log_filter()
+
+                    if is_qwen_vl:
+                        llm_kwargs["trust_remote_code"] = True
+                        # Merged dirs: fix text_config for vLLM (see _vllm_grpo_hf_overrides_for_qwen_vl).
+                        llm_kwargs["hf_overrides"] = _vllm_grpo_hf_overrides_for_qwen_vl
+
+                    proc_for_vllm = (
+                        os.environ.get("PROCESSOR_PATH", "").strip()
+                        or os.environ.get("QWEN_BASE_PATH", "").strip()
+                    )
+                    if proc_for_vllm:
+                        # vLLM loads HF processor from model dir only; merged processor JSON can break
+                        # (duplicate image_processor). Redirect cached_get_processor + tokenizer path.
+                        _ensure_vllm_hf_processor_loads_from_processor_path(model.name_or_path)
+                        llm_kwargs["tokenizer"] = proc_for_vllm
 
                     # Try old API (`device`) first, then fallback to newer (`device_config`).
                     llm_kwargs["device"] = vllm_device
@@ -692,12 +1014,76 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
+    def _log_image_fallback(self, message: str) -> None:
+        """Rate-limited warning so bad shards do not flood logs."""
+        self._grpo_image_fallback_events += 1
+        cap = int(os.getenv("GRPO_IMAGE_FALLBACK_MAX_LOG", "30"))
+        every = max(1, int(os.getenv("GRPO_IMAGE_FALLBACK_LOG_EVERY", "200")))
+        n = self._grpo_image_fallback_events
+        if n <= cap or n % every == 0:
+            warnings.warn(
+                f"[GRPO image fallback #{n}] {message}",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    def _make_placeholder_pil(self) -> Image.Image:
+        """RGB image that always passes Qwen-VL smart_resize after spatial / aspect helpers."""
+        base = Image.new("RGB", (64, 64), (120, 120, 120))
+        try:
+            return self._resize_image_to_pixel_bounds(base)
+        except Exception:
+            return self._clamp_extreme_aspect_ratio(self._ensure_min_spatial_dims(base))
+
+    def _ensure_min_spatial_dims(self, image: Image.Image) -> Image.Image:
+        """Qwen2-VL / Qwen2.5-VL image_processor smart_resize requires each side >= factor (28)."""
+        min_side = int(os.getenv("GRPO_IMAGE_MIN_SPATIAL", "28"))
+        if min_side <= 0:
+            return image
+        w, h = image.size
+        if w >= min_side and h >= min_side:
+            return image
+        if min(w, h) <= 0:
+            return image
+        scale = min_side / float(min(w, h))
+        new_w = max(min_side, int(round(w * scale)))
+        new_h = max(min_side, int(round(h * scale)))
+        return image.resize((new_w, new_h), Image.BICUBIC)
+
+    def _clamp_extreme_aspect_ratio(self, image: Image.Image) -> Image.Image:
+        """Qwen2.5-VL smart_resize rejects max(h,w)/min(h,w) > 200; letterbox-pad to satisfy the bound."""
+        max_ratio = float(os.getenv("GRPO_IMAGE_MAX_ASPECT_RATIO", "200"))
+        if max_ratio <= 1:
+            return image
+        w, h = image.size
+        if min(w, h) <= 0:
+            return image
+        r = max(w, h) / min(w, h)
+        if r <= max_ratio:
+            return image
+        if w >= h:
+            new_h = max(h, int(math.ceil(w / max_ratio)))
+            new_w = w
+            pad_total = new_h - h
+            top = pad_total // 2
+            canvas = Image.new("RGB", (new_w, new_h), (0, 0, 0))
+            canvas.paste(image, (0, top))
+            return canvas
+        new_w = max(w, int(math.ceil(h / max_ratio)))
+        new_h = h
+        pad_total = new_w - w
+        left = pad_total // 2
+        canvas = Image.new("RGB", (new_w, new_h), (0, 0, 0))
+        canvas.paste(image, (left, 0))
+        return canvas
+
     def _resize_image_to_pixel_bounds(self, image: Image.Image) -> Image.Image:
         if not isinstance(image, Image.Image):
             return image
         width, height = image.size
         if width <= 0 or height <= 0:
-            return image
+            self._log_image_fallback("non-positive image size; using placeholder")
+            return self._make_placeholder_pil()
 
         pixels = width * height
         target_pixels = pixels
@@ -707,28 +1093,75 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             target_pixels = self.vllm_min_pixels
 
         if target_pixels == pixels:
-            return image
+            return self._clamp_extreme_aspect_ratio(self._ensure_min_spatial_dims(image))
 
         scale = (target_pixels / float(pixels)) ** 0.5
         new_w = max(1, int(width * scale))
         new_h = max(1, int(height * scale))
-        return image.resize((new_w, new_h), Image.BICUBIC)
+        out = image.resize((new_w, new_h), Image.BICUBIC)
+        return self._clamp_extreme_aspect_ratio(self._ensure_min_spatial_dims(out))
 
     def _load_image_item(self, item, max_frames=None):
         """Load and optionally subsample images. If item is a list, keep at most max_frames (default: self.vllm_max_frames)."""
         if max_frames is None:
             max_frames = self.vllm_max_frames
-        if isinstance(item, str):
-            return self._resize_image_to_pixel_bounds(Image.open(item).convert("RGB"))
+        if isinstance(item, str) or isinstance(item, os.PathLike):
+            path = os.fspath(item)
+            try:
+                if not os.path.isfile(path):
+                    self._log_image_fallback(f"image path missing or not a file: {path}")
+                    return self._make_placeholder_pil()
+                with Image.open(path) as im:
+                    rgb = im.convert("RGB")
+                return self._resize_image_to_pixel_bounds(rgb)
+            except Exception as exc:
+                self._log_image_fallback(f"failed to load image {path!r}: {exc!r}")
+                return self._make_placeholder_pil()
         if isinstance(item, list):
-            frames = [self._load_image_item(x, max_frames=None) for x in item]
+            if len(item) == 0:
+                self._log_image_fallback("empty frames list; using one placeholder frame")
+                return [self._make_placeholder_pil()]
+            frames = []
+            for x in item:
+                try:
+                    frames.append(self._load_image_item(x, max_frames=None))
+                except Exception as exc:
+                    self._log_image_fallback(f"frame load error: {exc!r}")
+                    frames.append(self._make_placeholder_pil())
+            flat: list = []
+            for f in frames:
+                if isinstance(f, list):
+                    flat.extend(f)
+                else:
+                    flat.append(f)
+            frames = flat
+            # Drop non-PIL entries (corrupt structure) so the processor never sees them.
+            cleaned = []
+            for f in frames:
+                if isinstance(f, Image.Image):
+                    cleaned.append(f)
+                else:
+                    self._log_image_fallback(
+                        f"unexpected frame type {type(f).__name__}; placeholder substituted"
+                    )
+                    cleaned.append(self._make_placeholder_pil())
+            frames = cleaned
+            if len(frames) == 0:
+                return [self._make_placeholder_pil()]
             if len(frames) > max_frames:
                 step = max(1, len(frames) // max_frames)
                 frames = frames[::step][:max_frames]
             return frames
         if isinstance(item, Image.Image):
-            return self._resize_image_to_pixel_bounds(item)
-        return item
+            try:
+                return self._resize_image_to_pixel_bounds(item)
+            except Exception as exc:
+                self._log_image_fallback(f"PIL resize/preprocess failed: {exc!r}")
+                return self._make_placeholder_pil()
+        self._log_image_fallback(
+            f"image_vllm has unsupported type {type(item).__name__}; using placeholder"
+        )
+        return self._make_placeholder_pil()
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -743,6 +1176,73 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 "question_id",
                 "question_category",
             ]
+
+    def _safe_multimodal_processor_inputs(
+        self, prompts_text: list, images: list
+    ) -> Any:
+        """Run the vision processor; on failure, retry once with per-sample placeholder frames (same counts)."""
+        kwargs = {
+            "text": copy.deepcopy(prompts_text),
+            "images": images,
+            "return_tensors": "pt",
+            "padding": True,
+            "padding_side": "left",
+            "add_special_tokens": False,
+        }
+        try:
+            return self.processing_class(**kwargs)
+        except Exception as exc:
+            if os.getenv("GRPO_DISABLE_PROCESSOR_FALLBACK", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            ):
+                raise
+            self._log_image_fallback(
+                f"processing_class failed ({exc!r}); retrying with placeholder frames only"
+            )
+            safe_images = []
+            for im in images:
+                if isinstance(im, list):
+                    n = len(im) if im else 1
+                    safe_images.append(
+                        [self._make_placeholder_pil() for _ in range(max(1, n))]
+                    )
+                elif isinstance(im, Image.Image):
+                    safe_images.append([self._make_placeholder_pil()])
+                else:
+                    safe_images.append([self._make_placeholder_pil()])
+            kwargs["images"] = safe_images
+            try:
+                return self.processing_class(**kwargs)
+            except Exception as exc2:
+                raise RuntimeError(
+                    "Multimodal processor failed even after substituting placeholder images. "
+                    "Check tokenizer/image token alignment or set GRPO_DISABLE_PROCESSOR_FALLBACK=1 for the raw error."
+                ) from exc2
+
+    def _forward_one_row_logprobs(
+        self,
+        model,
+        input_ids_1: torch.Tensor,
+        attention_mask_1: torch.Tensor,
+        pixel_values_single: torch.Tensor,
+        image_grid_thw_single: torch.Tensor,
+        logits_to_keep: int,
+    ) -> torch.Tensor:
+        """Single-row forward + log-probs on completion tokens (used with activation checkpointing)."""
+        logits_i = model(
+            input_ids_1,
+            attention_mask=attention_mask_1,
+            pixel_values=pixel_values_single,
+            image_grid_thw=image_grid_thw_single,
+            use_cache=False,
+        ).logits
+        logits_i = logits_i[:, :-1, :]
+        ids_i = input_ids_1[:, -logits_to_keep:]
+        logits_i = logits_i[:, -logits_to_keep:, :]
+        log_probs = logits_i[0].log_softmax(dim=-1)
+        return torch.gather(log_probs, dim=1, index=ids_i[0].unsqueeze(1)).squeeze(1)
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     def _get_per_token_logps(
@@ -761,23 +1261,38 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         pv_single = pixel_values[::B].to(model.device)
         thw_single = image_grid_thw[::B].to(device=model.device)
 
+        # Stacking B separate forwards in one autograd graph retains all activations at once and OOMs on 7B VL + long
+        # context. Checkpoint each row so only one forward's activations live at a time (recompute on backward).
+        use_row_ckpt = (
+            os.getenv("GRPO_ROW_ACTIVATION_CHECKPOINT", "true").strip().lower()
+            == "true"
+        )
         per_token_logps = []
         for i in range(B):
-            logits_i = model(
-                input_ids[i : i + 1],
-                attention_mask=attention_mask[i : i + 1],
-                pixel_values=pv_single,
-                image_grid_thw=thw_single,
-                use_cache=False,
-            ).logits  # (1, L, V)
-            logits_i = logits_i[:, :-1, :]
-            ids_i = input_ids[i : i + 1, -logits_to_keep:]
-            logits_i = logits_i[:, -logits_to_keep:, :]
-            log_probs = logits_i[0].log_softmax(dim=-1)
-            token_log_prob = torch.gather(
-                log_probs, dim=1, index=ids_i[0].unsqueeze(1)
-            ).squeeze(1)
-            per_token_logps.append(token_log_prob)
+            ids_1 = input_ids[i : i + 1]
+            mask_1 = attention_mask[i : i + 1]
+            if use_row_ckpt:
+                # Only tensor args to checkpoint(); logits_to_keep is an int (closure).
+                row = checkpoint(
+                    lambda a, b, pv, thw: self._forward_one_row_logprobs(
+                        model, a, b, pv, thw, logits_to_keep
+                    ),
+                    ids_1,
+                    mask_1,
+                    pv_single,
+                    thw_single,
+                    use_reentrant=False,
+                )
+            else:
+                row = self._forward_one_row_logprobs(
+                    model,
+                    ids_1,
+                    mask_1,
+                    pv_single,
+                    thw_single,
+                    logits_to_keep,
+                )
+            per_token_logps.append(row)
         return torch.stack(per_token_logps)
 
     # Trainer "prepares" the inputs before calling `compute_loss`. It converts to tensor and move to device.
@@ -793,6 +1308,8 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         images = []
         for example in inputs:
             reduced = self._load_image_item(example["image_vllm"])
+            if isinstance(reduced, Image.Image):
+                reduced = [reduced]
             ex = copy.deepcopy(example)
             ex["image_vllm"] = reduced
             if "image" in ex:
@@ -822,14 +1339,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             for example in normalized_examples
         ]
         # print(f"prompts_text: {prompts_text}")
-        prompt_inputs = self.processing_class(
-            text=copy.deepcopy(prompts_text),
-            images=images,
-            return_tensors="pt",
-            padding=True,
-            padding_side="left",
-            add_special_tokens=False,
-        )
+        prompt_inputs = self._safe_multimodal_processor_inputs(prompts_text, images)
         prompt_ids, prompt_mask = prompt_inputs["input_ids"].to(device), prompt_inputs["attention_mask"].to(device)
         
         if self.max_prompt_length is not None:
@@ -1215,6 +1725,8 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             normalized_batch = []
             for ex in batch:
                 reduced = self._load_image_item(ex["image_vllm"], max_frames=eval_max_frames)
+                if isinstance(reduced, Image.Image):
+                    reduced = [reduced]
                 ex_copy = copy.deepcopy(ex)
                 ex_copy["image_vllm"] = reduced
                 if "prompt" in ex_copy and len(ex_copy["prompt"]) >= 2:
@@ -1249,13 +1761,30 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                     chunk_inputs = all_multimodal_inputs[
                         chunk_start : chunk_start + self.vllm_prompt_batch_size
                     ]
-                    outputs.extend(
-                        self.llm.generate(
-                            chunk_inputs,
-                            sampling_params=sampling_params,
-                            use_tqdm=False,
+                    try:
+                        outputs.extend(
+                            self.llm.generate(
+                                chunk_inputs,
+                                sampling_params=sampling_params,
+                                use_tqdm=False,
+                            )
                         )
-                    )
+                    except Exception as exc:
+                        self._log_image_fallback(
+                            f"run_test_inference vLLM.generate failed ({exc!r}); "
+                            f"using stub completions for {len(chunk_inputs)} prompts"
+                        )
+                        stub_id = (
+                            self.processing_class.eos_token_id
+                            or self.processing_class.pad_token_id
+                            or 0
+                        )
+                        for _ in chunk_inputs:
+                            outputs.append(
+                                SimpleNamespace(
+                                    outputs=[SimpleNamespace(token_ids=[stub_id])]
+                                )
+                            )
             completion_ids = [out.token_ids for completion in outputs for out in completion.outputs]
             completion_texts = self.processing_class.batch_decode(
                 completion_ids, skip_special_tokens=True
@@ -1276,10 +1805,25 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
-        if next(iter(logs.keys())).startswith("eval_"):
+        if logs and next(iter(logs.keys())).startswith("eval_"):
             metrics = {f"eval_{key}": val for key, val in metrics.items()}
 
         logs = {**logs, **metrics}
+        if self.accelerator.is_main_process and logs:
+            first_key = next(iter(logs.keys()))
+            if not first_key.startswith("eval_"):
+                logger.info(
+                    format_grpo_train_metrics_line(logs, self.state.global_step)
+                )
+            else:
+                # Eval: same fields with eval_* prefix for file logs
+                eval_flat = {k[5:]: v for k, v in logs.items() if k.startswith("eval_")}
+                if eval_flat:
+                    line = format_grpo_train_metrics_line(
+                        eval_flat, self.state.global_step
+                    )
+                    logger.info(line.replace("[GRPO]", "[GRPO eval]", 1))
+
         if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
             super().log(logs, start_time)
         else:  # transformers<=4.46

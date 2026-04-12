@@ -1,9 +1,0 @@
-datasets
-huggingface_hub
-numpy
-Pillow
-PyAV
-PyYAML
-transformers
-vllm
-yt-dlp
